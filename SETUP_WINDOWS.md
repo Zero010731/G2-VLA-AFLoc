@@ -215,3 +215,61 @@ convert_coco_json_to_csv.py
 ```
 
 注意：MS-CXR 只提供短语-框标注，不包含胸片图像本体。真正的图像需要从 MIMIC-CXR-JPG 另行下载，然后把 `localization\constants.py` 里的 `MIMIC_IMG_DIR` 指向本地 MIMIC-CXR-JPG 图像目录。
+
+当前项目内已经支持用环境变量覆盖路径，不必每次手改代码：
+
+```powershell
+$env:MS_CXR_JSON = "C:\Users\joker\Desktop\AFLoc\data\ms-cxr\1.1.0\MS_CXR_Local_Alignment_v1.1.0.json"
+$env:MIMIC_CXR_JPG_ROOT = "你的MIMIC-CXR-JPG图像根目录"
+```
+
+MS-CXR 标注里的图像路径长这样：
+
+```text
+files/p10/p10233088/s54276838/675d792f-a3521e48-5eec8573-1e81d644-e60c34f8.jpg
+```
+
+AFLoc 的 MS-CXR loader 会自动去掉开头的 `files/`，所以如果你的真实图片是：
+
+```text
+/mnt/mimic-cxr/jpg/files/p10/...
+```
+
+那么应设置：
+
+```powershell
+$env:MIMIC_CXR_JPG_ROOT = "/mnt/mimic-cxr/jpg/files"
+```
+
+如果你的真实图片是：
+
+```text
+/mnt/mimic-cxr/jpg/p10/...
+```
+
+那么应设置：
+
+```powershell
+$env:MIMIC_CXR_JPG_ROOT = "/mnt/mimic-cxr/jpg"
+```
+
+可以先用路径探测脚本确认哪一层正确：
+
+```powershell
+conda run -n AFLoc python scripts\check_ms_cxr_paths.py --mimic-root "你的MIMIC-CXR-JPG候选根目录"
+```
+
+服务器上可以使用模板脚本：
+
+```bash
+bash scripts/run_ms_cxr_server.sh
+```
+
+如果服务器真实图像根目录不是默认值，可以临时覆盖：
+
+```bash
+MS_CXR_JSON=/path/to/MS_CXR_Local_Alignment_v1.1.0.json \
+MIMIC_CXR_JPG_ROOT=/mnt/mimic-cxr/jpg/files \
+GPU=0 \
+bash scripts/run_ms_cxr_server.sh
+```
