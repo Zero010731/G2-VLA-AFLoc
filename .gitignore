@@ -1,9 +1,64 @@
-
+# Python cache
 __pycache__/
-data
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Environments
+.conda/
+.env
+.venv/
+env/
+venv/
+
+# Checkpoints / weights
+weight/
+weights/
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# Datasets
+data/
+datasets/
+MIMIC-CXR/
+MS-CXR/
+RSNA/
+CheXlocalize/
+
+# Outputs / logs
+outputs/
+runs/
+logs/
+wandb/
+tensorboard/
+*.log
+
+# Temporary files
+tmp/
 *.pickle
+
+# Medical image files
+*.dcm
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.nrrd
+
+# IDE / OS
+.vscode/
+.idea/
 launch.json
-tmp
-emilyalsentzer
-weight/*
-data
+.DS_Store
+Thumbs.db
+
+# HuggingFace / local cache
+emilyalsentzer/
+
+# Local path configs
+configs/local_paths.yaml
+configs/server_paths.yaml

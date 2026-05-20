@@ -4,6 +4,25 @@ from . import models
 from . import lightning
 from . import datasets
 from typing import Union
+from omegaconf import OmegaConf
+
+
+def _normalize_ckpt_cfg(cfg):
+    """Recreate old pickled OmegaConf configs for newer OmegaConf versions."""
+    def _to_plain(obj):
+        if hasattr(obj, "_content"):
+            content = object.__getattribute__(obj, "_content")
+            if isinstance(content, dict):
+                return {k: _to_plain(v) for k, v in content.items()}
+            if isinstance(content, list):
+                return [_to_plain(v) for v in content]
+        if hasattr(obj, "_value"):
+            return obj._value()
+        return obj
+
+    if hasattr(cfg, "_metadata"):
+        cfg = _to_plain(cfg)
+    return OmegaConf.create(cfg)
 
 
 def load_model(
@@ -14,7 +33,7 @@ def load_model(
     """Loads the model from checkpoint file."""
     # Load the checkpoint
     ckpt = torch.load(ckpt_path, map_location=device)
-    cfg = ckpt["hyper_parameters"]
+    cfg = _normalize_ckpt_cfg(ckpt["hyper_parameters"])
     ckpt_dict = ckpt["state_dict"]
 
     # Fix the keys in the checkpoint dictionary
@@ -69,7 +88,7 @@ def build_model(cfg):
 def build_model_from_ckpt(ckpt):
     """Build the AFLoc model from the checkpoint file."""
     ckpt = torch.load(ckpt)
-    cfg = ckpt["hyper_parameters"]
+    cfg = _normalize_ckpt_cfg(ckpt["hyper_parameters"])
     ckpt_dict = ckpt["state_dict"]
 
     fixed_ckpt_dict = {}
