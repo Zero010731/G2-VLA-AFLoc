@@ -19,7 +19,10 @@ import cv2
 FONT_MAX = 50
 matplotlib.use('Agg')
 from functools import reduce
-
+import matplotlib.pyplot as plt
+from pathlib import Path
+import cv2
+import os
 class ImageTextInferenceEngine:
     """Base class for image-text inference engine."""
 
@@ -171,7 +174,13 @@ class Pipeline:
     
     def run(self, **kwargs):
         self.kwargs.update(kwargs)
-        self.createdir(kwargs["ckpt"], kwargs["dataset"])
+        # 优先使用传入的 outdir，没有再用默认规则
+        outdir = kwargs.get("outdir", None)
+        self.createdir(kwargs["ckpt"], kwargs["dataset"], outdir=outdir)
+        
+        # 确保后面 test 或 get_hmaps 能够读取到外部的 visualize 参数
+        if "visualize" not in self.kwargs:
+            self.kwargs["visualize"] = kwargs.get("visualize", False)
         if kwargs["opt_th"]:
             suffix = "_use_prob" if "use_prob" in kwargs and kwargs["use_prob"] else ""
             save_path = f"{self.save_dir}/opt_th{suffix}.csv" 
@@ -211,9 +220,10 @@ class Pipeline:
                     hmaps=hmaps,
                     **kwargs) 
 
-    def createdir(self, ckpt: str, dataset: str):
-        """Create directory to save results."""
-        if os.path.exists(ckpt):
+    def createdir(self, ckpt: str, dataset: str, outdir: str = None):
+        if outdir is not None:
+            self.save_dir = outdir
+        elif os.path.exists(ckpt):
             dn = os.path.join(os.path.dirname(ckpt), dataset)
             bn = os.path.splitext(os.path.basename(ckpt))[0]
             self.save_dir = os.path.join(dn, bn)
@@ -225,23 +235,63 @@ class Pipeline:
         """Get similarity maps for all images and text queries."""
         suffix = kwargs["suffix"] if "suffix" in kwargs else ""
         save_path = os.path.join(self.save_dir, f"hmaps{suffix}.npy")
-        if os.path.exists(save_path) and redo == False:
+        visualize = kwargs.get("visualize", False)
+        
+        # 修复非 GUI 环境下 matplotlib 绘图弹窗崩溃或不保存的问题
+        import matplotlib
+        matplotlib.use('Agg') 
+        import matplotlib.pyplot as plt
+
+        if os.path.exists(save_path) and not redo:
+            print(f"Loading cached hmaps from {save_path}")
             hmaps = np.load(save_path, allow_pickle=True).item()
         else:
             hmaps = {}
             self.image_text_inference.load_model(**kwargs)
-            for i in tqdm(range(len(path_list[:]))):
+            
+            for i in tqdm(range(len(path_list[:])), desc=f"Generating hmaps {suffix}"):
                 hmap, img_emb, text_emb = self.image_text_inference.get_similarity_map_from_raw_data(
                     image_path=path_list[i],
                     query_text=label_text[i],
                     device="cuda",
                     interpolation="bilinear",
                 )
+                
+                # 安全转换：确保 hmap 是 numpy 数组，且在 CPU 上
+                if torch.is_tensor(hmap):
+                    hmap = hmap.detach().cpu().numpy()
+                
                 mask_shape = gtmasks[i].shape
                 if mask_shape[0] != hmap.shape[0] or mask_shape[1] != hmap.shape[1]:
                     hmap = cv2.resize(hmap, (mask_shape[1], mask_shape[0]))
-                key = str(path_list[i]) + label_text[i]
+                
+                # 核心修复：把保存数据逻辑移到最外层，确保不论可不可视化都能正确存入字典
+                key = str(path_list[i]) + str(label_text[i])
                 hmaps[key] = {"hmap": hmap}
+
+                # 可视化逻辑
+                if visualize:
+                    os.makedirs(self.save_dir, exist_ok=True)
+                    img = cv2.imread(str(path_list[i]), cv2.IMREAD_GRAYSCALE)
+                    
+                    if img is not None:
+                        if img.shape[0] != hmap.shape[0] or img.shape[1] != hmap.shape[1]:
+                            img = cv2.resize(img, (hmap.shape[1], hmap.shape[0]))
+
+                        fig, ax = plt.subplots(figsize=(6, 6))
+                        ax.imshow(img, cmap="gray")
+                        # 确保使用 numpy 绘制
+                        ax.imshow(hmap, cmap="jet", alpha=0.5)
+                        ax.axis("off")
+
+                        img_name = Path(path_list[i]).stem
+                        safe_label = str(label_text[i]).replace(" ", "_").replace("/", "_")
+                        save_img_path = os.path.join(self.save_dir, f"{img_name}_{safe_label}_overlay.png")
+
+                        plt.savefig(save_img_path, bbox_inches="tight", pad_inches=0, dpi=150)
+                        plt.close(fig)
+                    else:
+                        print(f"Warning: Could not load image {path_list[i]} for visualization.")
 
             np.save(save_path, hmaps)
         return hmaps
@@ -681,8 +731,8 @@ def bootci(df, save_dir, metric="iou"):
     for task in bs_df.columns:
         records.append(create_ci_record(bs_df[task], task))
     ci_df = pd.DataFrame.from_records(records).sort_values(by='name')
-    mean = ci_df.mean(axis=0)
-    ci_df = ci_df.append(mean, ignore_index=True)
+    mean = ci_df.select_dtypes(include='number').mean(axis=0)
+    ci_df = pd.concat([ci_df, pd.DataFrame([mean])], ignore_index=True)
     ci_df = ci_df.round(3)
     ci_df.to_csv(f'{save_dir}/test_{metric}_summary_results.csv', index=False)
     return ci_df

@@ -13,6 +13,7 @@ FONT_MAX = 50
 matplotlib.use('Agg')
 
 
+
 class Engine(ImageTextInferenceEngine):
     """Engine for inference."""
 
@@ -73,7 +74,7 @@ class Engine(ImageTextInferenceEngine):
 def main(**kwargs):
     engine = Engine()
     pipeline = Pipeline(engine, **kwargs)
-    pipeline.run(**kwargs)
+    pipeline.run(**kwargs)  # 这里不要再写 save_dir 或 visualize
     return True
 
 
@@ -91,9 +92,12 @@ if __name__ == "__main__":
     parser.add_argument('--eval_val_or_test', type=str, default='test', choices=['val', 'test'])
     parser.add_argument('--use_prob', action='store_true', default=False)
     parser.add_argument('--margin', action='store_true', default=False)
+    parser.add_argument('--visualize', action='store_true', default=True, help='是否生成热力图 overlay')
+    parser.add_argument('--outdir', type=str, default='outputs/heatmap_ms_cxr', help='热力图输出目录')
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-
+    if not os.path.exists(args.outdir):
+        os.makedirs(args.outdir)
     res = main(**vars(args))
 
 

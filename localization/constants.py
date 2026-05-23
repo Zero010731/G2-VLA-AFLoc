@@ -8,7 +8,7 @@ def env_path(name, default):
 
 
 MIMIC_DATA_DIR = Path("/mnt/mimic-cxr")
-MS_CXR_JSON = Path("/mnt/mimic-cxr/ms-cxr_1.1.0/MS_CXR_Local_Alignment_v1.1.0.json")
+MS_CXR_JSON = Path("/mnt/zhangran/ms-cxr_1.1.0/MS_CXR_Local_Alignment_v1.1.0.json")
 MIMIC_IMG_DIR = Path("/mnt/mimic-cxr/jpg")
 
 
