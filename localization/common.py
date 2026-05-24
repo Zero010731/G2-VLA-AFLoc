@@ -232,24 +232,22 @@ class Pipeline:
         os.makedirs(self.save_dir, exist_ok=True)
 
     def get_hmaps(self, path_list: list, label_text: list, gtmasks, redo=False, **kwargs):
-        """Get similarity maps for all images and text queries."""
+        """Get similarity maps for all images and text queries with paper-style visualization."""
         suffix = kwargs["suffix"] if "suffix" in kwargs else ""
         save_path = os.path.join(self.save_dir, f"hmaps{suffix}.npy")
         visualize = kwargs.get("visualize", False)
         
-        # 修复非 GUI 环境下 matplotlib 绘图弹窗崩溃或不保存的问题
         import matplotlib
         matplotlib.use('Agg') 
         import matplotlib.pyplot as plt
-
-        if os.path.exists(save_path) and not redo:
-            print(f"Loading cached hmaps from {save_path}")
+        import matplotlib.patches as patches
+        from matplotlib.colors import LinearSegmentedColormap
+        if os.path.exists(save_path) and redo == False:
             hmaps = np.load(save_path, allow_pickle=True).item()
         else:
             hmaps = {}
             self.image_text_inference.load_model(**kwargs)
-            
-            for i in tqdm(range(len(path_list[:])), desc=f"Generating hmaps {suffix}"):
+            for i in tqdm(range(len(path_list[:])), desc=f"Generating hmaps{suffix}"):
                 hmap, img_emb, text_emb = self.image_text_inference.get_similarity_map_from_raw_data(
                     image_path=path_list[i],
                     query_text=label_text[i],
@@ -257,41 +255,89 @@ class Pipeline:
                     interpolation="bilinear",
                 )
                 
-                # 安全转换：确保 hmap 是 numpy 数组，且在 CPU 上
                 if torch.is_tensor(hmap):
                     hmap = hmap.detach().cpu().numpy()
-                
+
                 mask_shape = gtmasks[i].shape
                 if mask_shape[0] != hmap.shape[0] or mask_shape[1] != hmap.shape[1]:
                     hmap = cv2.resize(hmap, (mask_shape[1], mask_shape[0]))
                 
-                # 核心修复：把保存数据逻辑移到最外层，确保不论可不可视化都能正确存入字典
-                key = str(path_list[i]) + str(label_text[i])
+                # 保存热力图数据到字典
+                key = str(path_list[i]) + label_text[i]
                 hmaps[key] = {"hmap": hmap}
 
-                # 可视化逻辑
                 if visualize:
                     os.makedirs(self.save_dir, exist_ok=True)
                     img = cv2.imread(str(path_list[i]), cv2.IMREAD_GRAYSCALE)
-                    
                     if img is not None:
                         if img.shape[0] != hmap.shape[0] or img.shape[1] != hmap.shape[1]:
                             img = cv2.resize(img, (hmap.shape[1], hmap.shape[0]))
 
-                        fig, ax = plt.subplots(figsize=(6, 6))
+                        # 创建画布
+                        fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+                        
+                        # 1. 绘制底图（普通的黑白胸片）
                         ax.imshow(img, cmap="gray")
-                        # 确保使用 numpy 绘制
-                        ax.imshow(hmap, cmap="jet", alpha=0.5)
-                        ax.axis("off")
 
+                        # --- 2. 完美还原论文调色盘 (连续型软渐变 + 增强医学色彩) ---
+                        # 标准化到 [0, 1]
+                        h_min, h_max = hmap.min(), hmap.max()
+                        if h_max - h_min > 1e-8:
+                            hmap_norm = (hmap - h_min) / (h_max - h_min)
+                        else:
+                            hmap_norm = np.zeros_like(hmap)
+
+                        # 复现论文多段高饱和度医学配色：
+                        # 核心点：加深中心色彩（深紫红），强化边缘色彩（明黄色），使过渡不显肉色
+                        colors = [
+                            (0.1, 0.45, 0.65),  # 0.0: Muted Blue (平淡背景)
+                            (0.98, 0.92, 0.3),  # 0.4: Vivid Yellow (过渡区边缘)
+                            (0.9, 0.25, 0.1),   # 0.7: Rich Orange-Red (强响应)
+                            (0.35, 0.02, 0.2)   # 1.0: Deep Purple-Red (中心最热病灶)
+                        ]
+                        paper_cmap = LinearSegmentedColormap.from_list("paper_medical_fusion", colors, N=256)
+
+                        # 【核心修复】连续型软渐变透明度（摒弃硬切割）：
+                        # 1. 弱相关区域（小于 0.35）彻底全透明，清除背景杂色
+                        # 2. 强相关区域（大于 0.35）其透明度随热力值增加而线性/非线性增大，形成丝滑晕染
+                        alpha_mask = np.zeros_like(hmap_norm)
+                        valid_pixels = hmap_norm > 0.35
+                        
+                        # 映射公式：让响应越高的地方越凝实（最大 alpha 达到 0.72），响应边缘自动淡化
+                        alpha_mask[valid_pixels] = 0.2 + 0.52 * ((hmap_norm[valid_pixels] - 0.35) / 0.65)
+
+                        # 叠加高精度、边缘柔和丝滑的论文风格热力图
+                        ax.imshow(hmap_norm, cmap=paper_cmap, alpha=alpha_mask, vmin=0.0, vmax=1.0)
+
+                        # --- 3. 自动提取并叠加金标准框（灰色虚线 GT Box） ---
+                        gt_mask = gtmasks[i]
+                        if gt_mask is not None and gt_mask.sum() > 0:
+                            # 从真实的二进制掩膜（gtmask）中找到病灶的上下左右边界
+                            y_indices, x_indices = np.where(gt_mask > 0)
+                            if len(x_indices) > 0 and len(y_indices) > 0:
+                                xmin, xmax = x_indices.min(), x_indices.max()
+                                ymin, ymax = y_indices.min(), y_indices.max()
+                                
+                                # 绘制与论文一模一样的灰色虚线金标准框
+                                rect_gt = patches.Rectangle(
+                                    (xmin, ymin), xmax - xmin, ymax - ymin,
+                                    linewidth=2.0,       # 框的粗细
+                                    edgecolor='#777777', # 论文标准的灰色
+                                    facecolor='none',    # 内部不填充
+                                    linestyle='--',      # 虚线
+                                )
+                                ax.add_patch(rect_gt)
+
+                        # 隐藏 Matplotlib 默认的坐标轴坐标
+                        ax.axis("off")
+                        
+                        # 保存图像，去除白边
                         img_name = Path(path_list[i]).stem
                         safe_label = str(label_text[i]).replace(" ", "_").replace("/", "_")
                         save_img_path = os.path.join(self.save_dir, f"{img_name}_{safe_label}_overlay.png")
 
-                        plt.savefig(save_img_path, bbox_inches="tight", pad_inches=0, dpi=150)
+                        plt.savefig(save_img_path, bbox_inches="tight", pad_inches=0)
                         plt.close(fig)
-                    else:
-                        print(f"Warning: Could not load image {path_list[i]} for visualization.")
 
             np.save(save_path, hmaps)
         return hmaps
