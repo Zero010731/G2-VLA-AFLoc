@@ -9,6 +9,7 @@ from . import losses
 from transformers import AutoTokenizer
 from nltk.tokenize import RegexpTokenizer
 from skimage import exposure
+from ..hf_utils import hf_from_pretrained_kwargs, resolve_bert_type
 
 
 class AFLoc(nn.Module):
@@ -31,7 +32,11 @@ class AFLoc(nn.Module):
         self.temp2 = self.cfg.model.afloc.temp2
         self.temp3 = self.cfg.model.afloc.temp3
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.model.text.bert_type)
+        self.bert_type = resolve_bert_type(self.cfg.model.text.bert_type)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.bert_type,
+            **hf_from_pretrained_kwargs(self.bert_type),
+        )
         self.ixtoword = {v: k for k, v in self.tokenizer.get_vocab().items()}
 
     def text_encoder_forward(self, caption_ids, attention_mask, token_type_ids):

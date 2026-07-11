@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 import numpy as np
+from ..hf_utils import hf_from_pretrained_kwargs, resolve_bert_type
 
 
 class BertEncoder(nn.Module):
@@ -9,7 +10,7 @@ class BertEncoder(nn.Module):
     def __init__(self, cfg):
         super(BertEncoder, self).__init__()
 
-        self.bert_type = cfg.model.text.bert_type
+        self.bert_type = resolve_bert_type(cfg.model.text.bert_type)
         self.last_n_layers = cfg.model.text.last_n_layers
         self.aggregate_method = cfg.model.text.aggregate_method
         self.norm = cfg.model.text.norm
@@ -19,10 +20,15 @@ class BertEncoder(nn.Module):
         self.take_sent_as_units = cfg.model.text.take_sent_as_units
 
         self.model = AutoModel.from_pretrained(
-            self.bert_type, output_hidden_states=True
+            self.bert_type,
+            output_hidden_states=True,
+            **hf_from_pretrained_kwargs(self.bert_type),
         )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.bert_type)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.bert_type,
+            **hf_from_pretrained_kwargs(self.bert_type),
+        )
         self.idxtoword = {v: k for k, v in self.tokenizer.get_vocab().items()}
 
         self.emb_global, self.emb_local = None, None

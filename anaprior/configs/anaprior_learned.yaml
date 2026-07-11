@@ -1,0 +1,26 @@
+paths:
+  mscxr_json: C:/Users/joker/Desktop/G2-VLA-AFLoc/data/ms-cxr/1.1.0/MS_CXR_Local_Alignment_v1.1.0_radgraph_phrase.json
+  chest_imagenome_root: C:/baidunetdiskdownload/chest-imagenome_1.0.0
+  stage_b_outdir: outputs/anaprior_stage_b_splits
+
+classes:
+  candidate_repair:
+    - Pneumothorax
+    - Pleural Effusion
+  non_candidate:
+    - Atelectasis
+    - Cardiomegaly
+    - Consolidation
+    - Edema
+    - Lung Opacity
+    - Pneumonia
+
+split_policy:
+  exclude_mscxr_patients: true
+  heldout_source: chest_imagenome_valid
+  allow_mscxr_for_training: false
+
+predictor_gate:
+  min_candidate_auroc: 0.70
+  require_pr_auc_above_prevalence: true
+
