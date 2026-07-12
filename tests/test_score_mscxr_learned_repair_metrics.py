@@ -14,6 +14,7 @@ from anaprior.eval.score_mscxr_learned_repair_metrics import (
     comparison_specs_for_methods,
     coerce_eval_dataframe,
     evaluate_hmaps,
+    filter_eval_dataframe_by_hmap_keys,
     filter_eval_dataframe_by_categories,
     metric_dataframe_from_category_values,
     make_learned_repair_decision,
@@ -198,6 +199,46 @@ def test_filter_eval_dataframe_by_categories_drops_unsupported_categories_before
     assert filtered.index.tolist() == [0, 1]
 
 
+def test_filter_eval_dataframe_by_hmap_keys_keeps_only_scoreable_rows() -> None:
+    data = pd.DataFrame(
+        {
+            "path": ["a.jpg", "b.jpg", "c.jpg"],
+            "label_text": ["finding A", "finding B", "finding C"],
+            "category": ["Pneumonia", "Pneumonia", "Pneumonia"],
+        }
+    )
+
+    filtered = filter_eval_dataframe_by_hmap_keys(data, {"a.jpgfinding A", "c.jpgfinding C"})
+
+    assert filtered["path"].tolist() == ["a.jpg", "c.jpg"]
+    assert filtered.index.tolist() == [0, 1]
+
+
+def test_filter_eval_dataframe_by_hmap_keys_accepts_unique_path_prefix_alias() -> None:
+    data = pd.DataFrame(
+        {
+            "path": ["a.jpg", "b.jpg", "c.jpg"],
+            "label_text": [
+                "Findings suggesting Pneumonia.",
+                "Findings suggesting Pneumonia.",
+                "Findings suggesting Pneumonia.",
+            ],
+            "category": ["Pneumonia", "Pneumonia", "Pneumonia"],
+        }
+    )
+
+    filtered = filter_eval_dataframe_by_hmap_keys(
+        data,
+        {
+            "a.jpgPneumonia",
+            "b.jpgPneumonia",
+            "b.jpgPneumonia alternative",
+        },
+    )
+
+    assert filtered["path"].tolist() == ["a.jpg"]
+
+
 def test_metric_dataframe_from_category_values_keeps_numeric_columns() -> None:
     df = metric_dataframe_from_category_values(
         {
@@ -299,6 +340,23 @@ def test_comparison_specs_for_methods_adds_named_v3_validation_gate() -> None:
     assert "validation_gated_dcem_v3_vs_phrase_anatomy_dcem" in names
     assert "validation_gated_dcem_v3_vs_disease_pooled_learned" in names
     assert "validation_gated_dcem_v3_vs_candidate_shuffled" in names
+
+
+def test_comparison_specs_for_methods_adds_validation_gate_fallback_comparison() -> None:
+    specs = comparison_specs_for_methods(
+        {
+            "baseline",
+            "phrase_anatomy_dcem",
+            "dp_msa_v2_property_over_v3",
+            "validation_gated_dp_msa_v2_property_over_v3",
+        },
+        validation_gate_method_name="validation_gated_dp_msa_v2_property_over_v3",
+        validation_gate_source_method="dp_msa_v2_property_over_v3",
+        validation_gate_fallback_method="phrase_anatomy_dcem",
+    )
+    names = {name for name, _, _ in specs}
+
+    assert "validation_gated_dp_msa_v2_property_over_v3_vs_phrase_anatomy_dcem" in names
 
 
 def test_comparison_specs_for_methods_adds_dp_msa_lambda_sweep_comparisons() -> None:

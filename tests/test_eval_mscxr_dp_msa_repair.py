@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from anaprior.eval.disease_properties import DISEASE_PROPERTY_NAMES
 from anaprior.eval.eval_mscxr_dp_msa_repair import build_dp_msa_hmaps, main
 from anaprior.eval.phrase_subtype import PHRASE_SUBTYPE_TO_ID
 from anaprior.models.dp_msa_adapter import DPMultiScaleSpatialAdapter
@@ -28,6 +29,31 @@ def _checkpoint(path: Path) -> None:
             "finding_vocab": {"Pneumonia": 0, "Lung Opacity": 1},
             "subtype_vocab": dict(PHRASE_SUBTYPE_TO_ID),
             "region_names": ["left_lower_lung", "right_lower_lung"],
+        },
+        path,
+    )
+
+
+def _property_checkpoint(path: Path) -> None:
+    model_config = {
+        "num_diseases": 2,
+        "num_subtypes": len(PHRASE_SUBTYPE_TO_ID),
+        "num_regions": 2,
+        "num_disease_properties": len(DISEASE_PROPERTY_NAMES),
+        "hidden_channels": 4,
+        "embedding_dim": 4,
+        "lambda_weight": 0.1,
+        "residual_scale": 0.25,
+    }
+    model = DPMultiScaleSpatialAdapter(**model_config)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_config": model_config,
+            "finding_vocab": {"Pneumonia": 0, "Lung Opacity": 1},
+            "subtype_vocab": dict(PHRASE_SUBTYPE_TO_ID),
+            "region_names": ["left_lower_lung", "right_lower_lung"],
+            "disease_property_names": DISEASE_PROPERTY_NAMES,
         },
         path,
     )
@@ -131,6 +157,26 @@ def test_build_dp_msa_hmaps_supports_lambda_override_and_method_name(tmp_path: P
     assert set(hmaps) == {"baseline", "dp_msa_lambda0p02"}
     assert hmaps["dp_msa_lambda0p02"]["case-pna"]["learned_repair"] == "dp_msa_lambda0p02_repaired"
     assert stats["dp_msa_lambda0p02"]["repaired_categories"] == {"Pneumonia": 1}
+
+
+def test_build_dp_msa_hmaps_uses_property_conditioned_checkpoint(tmp_path: Path) -> None:
+    ckpt = tmp_path / "dp_msa_adapter.pt"
+    prepared = tmp_path / "inputs.npz"
+    score_csv = tmp_path / "scores.csv"
+    _property_checkpoint(ckpt)
+    _prepared_inputs(prepared)
+    _scores(score_csv)
+
+    hmaps, stats = build_dp_msa_hmaps(
+        prepared_inputs_npz=prepared,
+        region_score_csv=score_csv,
+        checkpoint=ckpt,
+        device="cpu",
+        method_name="dp_msa_v2",
+    )
+
+    assert "case-pna" in hmaps["dp_msa_v2"]
+    assert stats["dp_msa_v2"]["property_conditioned_categories"] == {"Pneumonia": 1}
 
 
 def test_main_writes_dp_msa_hmap_outputs(tmp_path: Path) -> None:

@@ -61,6 +61,7 @@ def comparison_specs_for_methods(
     methods: set[str] | list[str] | tuple[str, ...],
     validation_gate_method_name: str = VALIDATION_GATED_METHOD,
     validation_gate_source_method: str = "disease_gated_learned",
+    validation_gate_fallback_method: str = "baseline",
 ) -> list[tuple[str, str, str]]:
     """Return comparison specs supported by the available method outputs."""
 
@@ -77,10 +78,12 @@ def comparison_specs_for_methods(
 
     gate_method = str(validation_gate_method_name)
     source_method = str(validation_gate_source_method)
+    fallback_method = str(validation_gate_fallback_method)
     if gate_method in method_set:
         dynamic_specs = [
             (f"{gate_method}_vs_baseline", gate_method, "baseline"),
             (f"{gate_method}_vs_{source_method}", gate_method, source_method),
+            (f"{gate_method}_vs_{fallback_method}", gate_method, fallback_method),
             (f"{gate_method}_vs_disease_pooled_learned", gate_method, "disease_pooled_learned"),
             (f"{gate_method}_vs_candidate_shuffled", gate_method, "candidate_shuffled"),
         ]
@@ -149,6 +152,41 @@ def filter_eval_dataframe_by_categories(
     if not category_set:
         return data.copy()
     return data[data["category"].astype(str).isin(category_set)].copy()
+
+
+def resolve_hmap_key(path: Any, label_text: Any, hmap_keys: set[str]) -> str | None:
+    """Resolve dataset row identity to an hmap key.
+
+    Stage C hmap keys historically use `path + label_text`, but some generated
+    subsets use a shorter phrase suffix. Exact match is preferred; a unique
+    key with the same image path prefix is accepted as a conservative alias.
+    """
+
+    exact = str(path) + str(label_text)
+    if exact in hmap_keys:
+        return exact
+    prefix = str(path)
+    candidates = [key for key in hmap_keys if key.startswith(prefix)]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def filter_eval_dataframe_by_hmap_keys(data: pd.DataFrame, hmap_keys: set[str]) -> pd.DataFrame:
+    """Keep only evaluation rows with heatmaps available for every scored method."""
+
+    required = {"path", "label_text"}
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(f"evaluation data is missing required columns: {sorted(missing)}")
+    key_set = {str(key) for key in hmap_keys}
+    keep = [
+        resolve_hmap_key(path, label_text, key_set) is not None
+        for path, label_text in zip(data["path"], data["label_text"])
+    ]
+    out = data[keep].copy()
+    out.index = range(len(out))
+    return out
 
 
 def metric_dataframe_from_category_values(category_values: dict[str, list[float]]) -> pd.DataFrame:
@@ -634,12 +672,15 @@ def evaluate_hmaps(data: pd.DataFrame, hmaps: dict[str, dict[str, Any]], dataset
     if margin:
         from localization.common import Pipeline
 
+    hmap_key_set = {str(key) for key in hmaps}
     for threshold in threshold_list:
         cat_ious = defaultdict(list)
         cat_cnrs = defaultdict(list)
         cat_dices = defaultdict(list)
         for path, label_text, gtmask, cat in zip(data["path"], data["label_text"], data["gtmasks"], data["category"]):
-            key = str(path) + label_text
+            key = resolve_hmap_key(path, label_text, hmap_key_set)
+            if key is None:
+                raise KeyError(str(path) + str(label_text))
             hmap = np.asarray(hmaps[key]["hmap"], dtype=np.float32)
             if margin:
                 hmap = Pipeline.set_margin(hmap)
@@ -734,6 +775,7 @@ def score_method_hmaps(
     macro_all_harm_floor: float = -0.005,
     validation_gate: bool = False,
     validation_gate_source_method: str = "disease_gated_learned",
+    validation_gate_fallback_method: str = "baseline",
     validation_gate_method_name: str = VALIDATION_GATED_METHOD,
     validation_gate_effect_floor: float = 0.02,
     validation_gate_ci_low_floor: float = 0.0,
@@ -745,14 +787,27 @@ def score_method_hmaps(
     data = filter_eval_dataframe_by_categories(raw_data, candidate_categories)
     if data.empty:
         raise ValueError(f"No evaluation rows remain after filtering to candidate_categories={candidate_categories}")
+    num_eval_rows_after_category_filter = int(data.shape[0])
 
-    per_case_by_method: dict[str, pd.DataFrame] = {}
-    metric_outputs: dict[str, dict[str, str]] = {}
+    hmaps_by_method: dict[str, dict[str, Any]] = {}
+    common_hmap_keys: set[str] | None = None
     for method in methods:
         hmap_path = hmaps_root / method / "hmaps.npy"
         if not hmap_path.exists():
             raise FileNotFoundError(hmap_path)
         hmaps = np.load(hmap_path, allow_pickle=True).item()
+        hmaps_by_method[method] = hmaps
+        method_keys = {str(key) for key in hmaps}
+        common_hmap_keys = method_keys if common_hmap_keys is None else common_hmap_keys & method_keys
+    data = filter_eval_dataframe_by_hmap_keys(data, common_hmap_keys or set())
+    if data.empty:
+        raise ValueError("No evaluation rows have heatmaps for every requested method")
+    num_eval_rows_after_hmap_filter = int(data.shape[0])
+
+    per_case_by_method: dict[str, pd.DataFrame] = {}
+    metric_outputs: dict[str, dict[str, str]] = {}
+    for method in methods:
+        hmaps = hmaps_by_method[method]
         method_dir = outdir / method
         metric_df, per_case = evaluate_hmaps(data, hmaps, dataset=dataset, save_dir=method_dir, margin=margin)
         per_case = add_method_metadata(per_case, method=method, val_fraction=val_fraction, seed=seed)
@@ -766,14 +821,15 @@ def score_method_hmaps(
 
     validation_gate_payload: dict[str, Any] | None = None
     if validation_gate:
-        required_methods = {"baseline", str(validation_gate_source_method)}
+        fallback_method = str(validation_gate_fallback_method)
+        required_methods = {fallback_method, str(validation_gate_source_method)}
         missing_required = sorted(required_methods - set(per_case_by_method))
         if missing_required:
             raise ValueError(f"validation_gate requires scored methods: {missing_required}")
-        gate_comparison = f"{validation_gate_source_method}_vs_baseline"
+        gate_comparison = f"{validation_gate_source_method}_vs_{fallback_method}"
         val_deltas = build_paired_delta_table(
             method_per_case=per_case_by_method[str(validation_gate_source_method)],
-            baseline_per_case=per_case_by_method["baseline"],
+            baseline_per_case=per_case_by_method[fallback_method],
             split="val",
         )
         val_per_class = per_class_paired_bootstrap_summary(
@@ -792,7 +848,7 @@ def score_method_hmaps(
             ci_low_floor=validation_gate_ci_low_floor,
         )
         validation_gated = build_validation_gated_per_case(
-            baseline_per_case=per_case_by_method["baseline"],
+            baseline_per_case=per_case_by_method[fallback_method],
             gated_per_case=per_case_by_method[str(validation_gate_source_method)],
             validation_gate_decisions=validation_gate_decisions,
             method_name=str(validation_gate_method_name),
@@ -808,7 +864,7 @@ def score_method_hmaps(
             "enabled": True,
             "method": str(validation_gate_method_name),
             "source_method": str(validation_gate_source_method),
-            "fallback_method": "baseline",
+            "fallback_method": fallback_method,
             "selection_split": "val",
             "comparison": gate_comparison,
             "metric": "cnr",
@@ -827,6 +883,7 @@ def score_method_hmaps(
         set(per_case_by_method),
         validation_gate_method_name=str(validation_gate_method_name),
         validation_gate_source_method=str(validation_gate_source_method),
+        validation_gate_fallback_method=str(validation_gate_fallback_method),
     )
     for split in ["val", "test"]:
         for comparison, method_a, method_b in comparison_specs:
@@ -876,6 +933,9 @@ def score_method_hmaps(
         "methods": methods,
         "candidate_categories": candidate_categories,
         "num_eval_rows_before_category_filter": int(raw_data.shape[0]),
+        "num_eval_rows_after_category_filter": num_eval_rows_after_category_filter,
+        "num_eval_rows_after_hmap_filter": num_eval_rows_after_hmap_filter,
+        "num_common_hmap_keys": int(len(common_hmap_keys or set())),
         "num_eval_rows": int(data.shape[0]),
         "decision": decision,
         "validation_gate": validation_gate_payload or {"enabled": False},
@@ -913,6 +973,11 @@ def parse_args() -> argparse.Namespace:
         help="Method used on validation split for disease-level pass/bypass decisions.",
     )
     parser.add_argument(
+        "--validation-gate-fallback-method",
+        default="baseline",
+        help="Method used when validation gate bypasses a category.",
+    )
+    parser.add_argument(
         "--validation-gate-method-name",
         default=VALIDATION_GATED_METHOD,
         help="Output method name for validation-gated per-case metrics.",
@@ -939,6 +1004,7 @@ def main() -> int:
         macro_all_harm_floor=args.macro_all_harm_floor,
         validation_gate=args.validation_gate,
         validation_gate_source_method=args.validation_gate_source_method,
+        validation_gate_fallback_method=args.validation_gate_fallback_method,
         validation_gate_method_name=args.validation_gate_method_name,
         validation_gate_effect_floor=args.validation_gate_effect_floor,
         validation_gate_ci_low_floor=args.validation_gate_ci_low_floor,

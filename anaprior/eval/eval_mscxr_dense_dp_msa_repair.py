@@ -1,4 +1,4 @@
-"""Build MS-CXR DP-MSA repair heatmaps from a frozen checkpoint."""
+"""Build MS-CXR Dense DP-MSA repair heatmaps from a frozen checkpoint."""
 
 from __future__ import annotations
 
@@ -11,30 +11,37 @@ from typing import Any
 import numpy as np
 import torch
 
-from anaprior.eval.eval_mscxr_learned_repair import (
-    _load_prepared_inputs,
-    load_region_score_table,
-    region_scores_for_case,
-)
-from anaprior.eval.disease_properties import DISEASE_PROPERTY_NAMES, disease_property_matrix
+from anaprior.eval.disease_properties import disease_property_matrix
+from anaprior.eval.eval_mscxr_learned_repair import _load_prepared_inputs, load_region_score_table, region_scores_for_case
 from anaprior.eval.phrase_subtype import phrase_subtype_id
-from anaprior.models.dp_msa_adapter import DPMultiScaleSpatialAdapter
+from anaprior.models.dense_dp_msa_adapter import DenseDPMultiScaleSpatialAdapter
+
+
+def load_spatial_feature_dict(path: Path) -> dict[str, torch.Tensor]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    case_ids = [str(case_id) for case_id in payload.get("case_ids", [])]
+    features = payload.get("spatial_features")
+    if features is None:
+        raise ValueError(f"{path} missing spatial_features")
+    if len(case_ids) != int(features.shape[0]):
+        raise ValueError("spatial feature cache case_ids length must match spatial_features rows")
+    return {case_id: features[idx].float() for idx, case_id in enumerate(case_ids)}
 
 
 def _load_checkpoint(
     path: Path,
     device: str,
     lambda_override: float | None = None,
-) -> tuple[DPMultiScaleSpatialAdapter, dict[str, Any]]:
+) -> tuple[DenseDPMultiScaleSpatialAdapter, dict[str, Any]]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    required = {"model_state_dict", "model_config", "finding_vocab", "subtype_vocab", "region_names"}
+    required = {"model_state_dict", "model_config", "subtype_vocab", "region_names"}
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"{path} missing checkpoint fields: {missing}")
     model_config = dict(payload["model_config"])
     if lambda_override is not None:
         model_config["lambda_weight"] = float(lambda_override)
-    model = DPMultiScaleSpatialAdapter(**model_config)
+    model = DenseDPMultiScaleSpatialAdapter(**model_config)
     model.load_state_dict(payload["model_state_dict"])
     model.to(torch.device(device))
     model.eval()
@@ -59,72 +66,57 @@ def _load_base_hmaps(path: Path | None) -> dict[str, np.ndarray]:
     raw = np.load(path, allow_pickle=True).item()
     out = {}
     for case_id, payload in raw.items():
-        if isinstance(payload, dict):
-            value = payload.get("hmap")
-        else:
-            value = payload
+        value = payload.get("hmap") if isinstance(payload, dict) else payload
         if value is not None:
             out[str(case_id)] = np.asarray(value, dtype=np.float32)
     return out
 
 
-def build_dp_msa_hmaps(
+def build_dense_dp_msa_hmaps(
     prepared_inputs_npz: Path,
     region_score_csv: Path,
+    spatial_feature_cache: Path,
     checkpoint: Path,
     device: str = "cpu",
-    method_name: str = "dp_msa",
+    method_name: str = "dense_dp_msa",
     lambda_override: float | None = None,
     base_hmaps_npy: Path | None = None,
     base_method_name: str = "prepared_inputs",
 ) -> tuple[dict[str, dict[str, dict[str, Any]]], dict[str, dict[str, dict[str, int]]]]:
     inputs = _load_prepared_inputs(prepared_inputs_npz)
     score_table = load_region_score_table(region_score_csv)
+    spatial_features = load_spatial_feature_dict(spatial_feature_cache)
     base_hmaps = _load_base_hmaps(base_hmaps_npy)
-    method_name = str(method_name).strip()
-    if not method_name:
-        raise ValueError("method_name must be non-empty")
     model, payload = _load_checkpoint(checkpoint, device=device, lambda_override=lambda_override)
-    finding_vocab = {str(k): int(v) for k, v in payload["finding_vocab"].items()}
     subtype_vocab = {str(k): int(v) for k, v in payload["subtype_vocab"].items()}
     expected_regions = list(payload["region_names"])
-    model_config = dict(payload["model_config"])
-    property_dim = model_config.get("num_disease_properties")
-    uses_disease_properties = property_dim is not None
-    if uses_disease_properties and int(property_dim) != len(DISEASE_PROPERTY_NAMES):
-        raise ValueError("checkpoint num_disease_properties does not match frozen disease property vocabulary")
     torch_device = torch.device(device)
     hmaps: dict[str, dict[str, dict[str, Any]]] = {"baseline": _baseline_hmaps(inputs), method_name: {}}
     stats = {
-        "baseline": {
-            "repaired_categories": {},
-            "missing_finding_vocab": {},
-            "region_mismatch": {},
-        },
         method_name: {
             "repaired_categories": Counter(),
-            "missing_finding_vocab": Counter(),
             "region_mismatch": Counter(),
+            "missing_spatial_features": Counter(),
             "missing_base_hmap": Counter(),
             "base_method_name": Counter(),
-            "property_conditioned_categories": Counter(),
-        },
+        }
     }
     with torch.no_grad():
         for item in inputs:
-            if item.category not in finding_vocab:
-                hmaps[method_name][item.case_id] = {
-                    "hmap": np.asarray(item.heatmap, dtype=np.float32).copy(),
-                    "learned_repair": "baseline_copy:missing_finding_vocab",
-                }
-                stats[method_name]["missing_finding_vocab"][item.category] += 1
-                continue
             if list(item.regions) != expected_regions:
                 hmaps[method_name][item.case_id] = {
                     "hmap": np.asarray(item.heatmap, dtype=np.float32).copy(),
                     "learned_repair": "baseline_copy:region_mismatch",
                 }
                 stats[method_name]["region_mismatch"][item.category] += 1
+                continue
+            spatial = spatial_features.get(str(item.case_id))
+            if spatial is None:
+                hmaps[method_name][item.case_id] = {
+                    "hmap": np.asarray(item.heatmap, dtype=np.float32).copy(),
+                    "learned_repair": "baseline_copy:missing_spatial_features",
+                }
+                stats[method_name]["missing_spatial_features"][item.category] += 1
                 continue
             if base_hmaps:
                 base_hmap = base_hmaps.get(str(item.case_id))
@@ -146,19 +138,15 @@ def build_dp_msa_hmaps(
                 torch.from_numpy(np.asarray(base_hmap, dtype=np.float32))[None, None].to(torch_device),
                 torch.from_numpy(np.asarray(item.region_maps, dtype=np.float32))[None].to(torch_device),
                 torch.from_numpy(np.asarray(scores, dtype=np.float32))[None].to(torch_device),
-                torch.tensor([finding_vocab[item.category]], dtype=torch.long, device=torch_device),
+                disease_property_matrix([item.category]).to(torch_device),
                 torch.tensor([subtype], dtype=torch.long, device=torch_device),
-                disease_properties=disease_property_matrix([item.category]).to(torch_device)
-                if uses_disease_properties
-                else None,
+                spatial[None].to(torch_device),
             )
             hmaps[method_name][item.case_id] = {
                 "hmap": out.final_heatmap[0, 0].detach().cpu().numpy().astype(np.float32),
                 "learned_repair": f"{method_name}_repaired",
             }
             stats[method_name]["repaired_categories"][item.category] += 1
-            if uses_disease_properties:
-                stats[method_name]["property_conditioned_categories"][item.category] += 1
     stats_out = {
         method: {key: {str(k): int(v) for k, v in value.items()} for key, value in method_stats.items()}
         for method, method_stats in stats.items()
@@ -166,7 +154,7 @@ def build_dp_msa_hmaps(
     return hmaps, stats_out
 
 
-def save_dp_msa_hmaps(
+def save_dense_dp_msa_hmaps(
     hmaps: dict[str, dict[str, dict[str, Any]]],
     stats: dict[str, dict[str, dict[str, int]]],
     outdir: Path,
@@ -186,13 +174,14 @@ def save_dp_msa_hmaps(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build DP-MSA repair heatmaps for MS-CXR evaluation.")
+    parser = argparse.ArgumentParser(description="Build Dense DP-MSA repair heatmaps.")
     parser.add_argument("--prepared-inputs-npz", required=True, type=Path)
     parser.add_argument("--region-score-csv", required=True, type=Path)
+    parser.add_argument("--spatial-feature-cache", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--outdir", required=True, type=Path)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--method-name", default="dp_msa")
+    parser.add_argument("--method-name", default="dense_dp_msa")
     parser.add_argument("--lambda-override", type=float, default=None)
     parser.add_argument("--base-hmaps-npy", type=Path, default=None)
     parser.add_argument("--base-method-name", default="prepared_inputs")
@@ -201,9 +190,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    hmaps, stats = build_dp_msa_hmaps(
+    hmaps, stats = build_dense_dp_msa_hmaps(
         prepared_inputs_npz=args.prepared_inputs_npz,
         region_score_csv=args.region_score_csv,
+        spatial_feature_cache=args.spatial_feature_cache,
         checkpoint=args.checkpoint,
         device=args.device,
         method_name=args.method_name,
@@ -211,21 +201,18 @@ def main(argv: list[str] | None = None) -> int:
         base_hmaps_npy=args.base_hmaps_npy,
         base_method_name=args.base_method_name,
     )
-    outputs = save_dp_msa_hmaps(hmaps, stats, args.outdir)
+    outputs = save_dense_dp_msa_hmaps(hmaps, stats, args.outdir)
     summary = {
         "status": "ok",
         "prepared_inputs_npz": str(args.prepared_inputs_npz),
         "region_score_csv": str(args.region_score_csv),
+        "spatial_feature_cache": str(args.spatial_feature_cache),
         "checkpoint": str(args.checkpoint),
         "outdir": str(args.outdir),
         "method_name": str(args.method_name),
-        "lambda_override": args.lambda_override,
-        "base_hmaps_npy": str(args.base_hmaps_npy) if args.base_hmaps_npy is not None else "",
-        "base_method_name": str(args.base_method_name),
-        "num_cases": len(hmaps["baseline"]),
         "outputs": outputs,
     }
-    summary_path = args.outdir / "dp_msa_repair_summary.json"
+    summary_path = args.outdir / "dense_dp_msa_repair_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return 0

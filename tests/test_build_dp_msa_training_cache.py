@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from anaprior.eval.disease_properties import DISEASE_PROPERTY_NAMES, disease_property_vector
 from anaprior.eval.phrase_subtype import PHRASE_SUBTYPE_TO_ID
 from anaprior.train.build_dp_msa_training_cache import build_dp_msa_training_cache, main
 from anaprior.train.train_dp_msa_adapter import REQUIRED_CACHE_FIELDS
@@ -71,6 +72,16 @@ def _write_base_hmaps(path: Path) -> None:
     np.save(path, hmaps)
 
 
+def _write_spatial_feature_cache(path: Path) -> None:
+    torch.save(
+        {
+            "case_ids": [f"case-{idx}" for idx in range(4)],
+            "spatial_features": torch.arange(4 * 3 * 2 * 2, dtype=torch.float32).view(4, 3, 2, 2),
+        },
+        path,
+    )
+
+
 def test_build_dp_msa_training_cache_writes_train_and_valid_pt(tmp_path: Path) -> None:
     prepared = tmp_path / "inputs.npz"
     scores = tmp_path / "scores.csv"
@@ -97,6 +108,8 @@ def test_build_dp_msa_training_cache_writes_train_and_valid_pt(tmp_path: Path) -
     assert REQUIRED_CACHE_FIELDS <= set(valid)
     assert train["finding_vocab"] == {"Pneumonia": 0, "Lung Opacity": 1}
     assert train["subtype_vocab"] == dict(PHRASE_SUBTYPE_TO_ID)
+    assert train["disease_property_names"] == DISEASE_PROPERTY_NAMES
+    assert train["disease_properties"].shape[1] == len(DISEASE_PROPERTY_NAMES)
     assert train["region_names"] == ["left_lower_lung", "right_lower_lung"]
     assert train["base_hmaps"].shape[1:] == (1, 2, 2)
     assert valid["target_hmaps"].shape[1:] == (1, 2, 2)
@@ -140,8 +153,40 @@ def test_build_dp_msa_training_cache_uses_v3_base_and_mixed_target(tmp_path: Pat
     assert torch.allclose(payload["base_hmaps"][row], expected_base)
     assert payload["target_mode"] == "mixed_base_region_score"
     assert payload["base_method_name"] == "phrase_anatomy_dcem"
+    assert torch.allclose(
+        payload["disease_properties"][row],
+        torch.tensor(disease_property_vector("Pneumonia"), dtype=torch.float32),
+    )
     assert payload["target_betas"][row].item() == torch.tensor(0.05).item()
     assert not torch.allclose(payload["target_hmaps"][row], payload["base_hmaps"][row])
+
+
+def test_build_dp_msa_training_cache_attaches_spatial_features(tmp_path: Path) -> None:
+    prepared = tmp_path / "inputs.npz"
+    scores = tmp_path / "scores.csv"
+    spatial = tmp_path / "spatial.pt"
+    outdir = tmp_path / "cache"
+    _write_prepared_inputs(prepared)
+    _write_scores(scores)
+    _write_spatial_feature_cache(spatial)
+
+    report = build_dp_msa_training_cache(
+        prepared_inputs_npz=prepared,
+        region_score_csv=scores,
+        outdir=outdir,
+        findings=["Pneumonia", "Lung Opacity"],
+        valid_fraction=0.5,
+        seed=11,
+        min_score_sum=0.0,
+        spatial_feature_cache=spatial,
+    )
+
+    train = torch.load(report["train_cache"], map_location="cpu", weights_only=False)
+    valid = torch.load(report["valid_cache"], map_location="cpu", weights_only=False)
+    assert "spatial_features" in train
+    assert "spatial_features" in valid
+    assert train["spatial_features"].shape[1:] == (3, 2, 2)
+    assert report["spatial_feature_cache"] == str(spatial)
 
 
 def test_main_writes_dp_msa_cache_report(tmp_path: Path) -> None:

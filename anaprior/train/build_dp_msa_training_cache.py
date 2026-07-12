@@ -21,6 +21,7 @@ from anaprior.eval.eval_mscxr_learned_repair import (
     load_region_score_table,
     region_scores_for_case,
 )
+from anaprior.eval.disease_properties import DISEASE_PROPERTY_NAMES, disease_property_vector
 from anaprior.eval.phrase_subtype import PHRASE_SUBTYPE_TO_ID, phrase_subtype_id
 
 
@@ -70,6 +71,19 @@ def load_hmap_dict(path: Path | None) -> dict[str, np.ndarray]:
             continue
         hmaps[str(case_id)] = np.asarray(value, dtype=np.float32)
     return hmaps
+
+
+def load_spatial_feature_dict(path: Path | None) -> dict[str, torch.Tensor]:
+    if path is None:
+        return {}
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    case_ids = [str(case_id) for case_id in payload.get("case_ids", [])]
+    features = payload.get("spatial_features")
+    if features is None:
+        raise ValueError(f"{path} missing spatial_features")
+    if len(case_ids) != int(features.shape[0]):
+        raise ValueError("spatial feature cache case_ids length must match spatial_features rows")
+    return {case_id: features[idx].float() for idx, case_id in enumerate(case_ids)}
 
 
 def stable_fraction(value: str, seed: int = 0) -> float:
@@ -144,12 +158,17 @@ def _tensor_payload(
 ) -> dict[str, Any]:
     if not records:
         raise ValueError("cannot build DP-MSA cache from zero records")
-    return {
+    payload = {
         "base_hmaps": torch.from_numpy(np.stack([record["base_hmap"] for record in records], axis=0)).float(),
         "region_maps": torch.from_numpy(np.stack([record["region_maps"] for record in records], axis=0)).float(),
         "region_scores": torch.from_numpy(np.stack([record["region_scores"] for record in records], axis=0)).float(),
         "target_hmaps": torch.from_numpy(np.stack([record["target_hmap"] for record in records], axis=0)).float(),
         "disease_ids": torch.tensor([int(record["disease_id"]) for record in records], dtype=torch.long),
+        "disease_properties": torch.tensor(
+            [disease_property_vector(str(record["category"])) for record in records],
+            dtype=torch.float32,
+        ),
+        "disease_property_names": DISEASE_PROPERTY_NAMES,
         "subtype_ids": torch.tensor([int(record["subtype_id"]) for record in records], dtype=torch.long),
         "case_ids": [str(record["case_id"]) for record in records],
         "categories": [str(record["category"]) for record in records],
@@ -165,6 +184,9 @@ def _tensor_payload(
         "disease_betas": dict(disease_betas),
         "uses_mscxr_boxes": False,
     }
+    if all("spatial_features" in record for record in records):
+        payload["spatial_features"] = torch.stack([record["spatial_features"].float() for record in records], dim=0)
+    return payload
 
 
 def build_dp_msa_training_cache(
@@ -183,12 +205,14 @@ def build_dp_msa_training_cache(
     base_method_name: str = "prepared_inputs",
     target_mix_beta: float = 1.0,
     disease_betas: dict[str, float] | None = None,
+    spatial_feature_cache: Path | None = None,
 ) -> dict[str, Any]:
     inputs = _load_prepared_inputs(prepared_inputs_npz)
     if max_cases is not None:
         inputs = inputs[: int(max_cases)]
     score_table = load_region_score_table(region_score_csv)
     base_hmaps = load_hmap_dict(base_hmaps_npy)
+    spatial_features = load_spatial_feature_dict(spatial_feature_cache)
     disease_betas = {str(key): float(value) for key, value in (disease_betas or {}).items()}
     target_mix_beta = float(target_mix_beta)
     target_mode = "mixed_base_region_score" if base_hmaps or target_mix_beta < 1.0 or disease_betas else "region_score_weighted"
@@ -205,6 +229,7 @@ def build_dp_msa_training_cache(
         "region_mismatch": Counter(),
         "low_score_sum": Counter(),
         "missing_base_hmap": Counter(),
+        "missing_spatial_features": Counter(),
     }
     region_names: list[str] | None = None
     for item in inputs:
@@ -236,6 +261,12 @@ def build_dp_msa_training_cache(
             base_hmap = np.asarray(maybe_base, dtype=np.float32)[None, :, :]
         else:
             base_hmap = fallback_base
+        spatial_feature = None
+        if spatial_features:
+            spatial_feature = spatial_features.get(str(item.case_id))
+            if spatial_feature is None:
+                skipped["missing_spatial_features"][category] += 1
+                continue
         region_target = region_score_weighted_target(item.region_maps, scores)
         beta = float(disease_betas.get(category, target_mix_beta))
         if target_mode == "region_score_weighted":
@@ -254,6 +285,7 @@ def build_dp_msa_training_cache(
                 "target_beta": beta,
                 "disease_id": int(finding_vocab[category]),
                 "subtype_id": int(phrase_subtype_id(str(phrase), category=category)),
+                **({"spatial_features": spatial_feature} if spatial_feature is not None else {}),
             }
         )
     if region_names is None:
@@ -291,6 +323,7 @@ def build_dp_msa_training_cache(
         "target_mode": target_mode,
         "base_method_name": str(base_method_name),
         "base_hmaps_npy": str(base_hmaps_npy) if base_hmaps_npy is not None else "",
+        "spatial_feature_cache": str(spatial_feature_cache) if spatial_feature_cache is not None else "",
         "target_mix_beta": float(target_mix_beta),
         "disease_betas": disease_betas,
         "uses_mscxr_boxes": False,
@@ -307,6 +340,7 @@ def build_dp_msa_training_cache(
         "duplicated_singleton": bool(duplicated_singleton),
         "finding_vocab": finding_vocab,
         "subtype_vocab": dict(PHRASE_SUBTYPE_TO_ID),
+        "disease_property_names": DISEASE_PROPERTY_NAMES,
         "region_names": region_names,
         "train_categories": {str(k): int(v) for k, v in train_categories.items()},
         "valid_categories": {str(k): int(v) for k, v in valid_categories.items()},
@@ -337,6 +371,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-method-name", default="prepared_inputs")
     parser.add_argument("--target-mix-beta", type=float, default=1.0)
     parser.add_argument("--disease-beta-json", default=None)
+    parser.add_argument("--spatial-feature-cache", type=Path, default=None)
     return parser.parse_args(argv)
 
 
@@ -358,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
         base_method_name=args.base_method_name,
         target_mix_beta=args.target_mix_beta,
         disease_betas=parse_json_mapping(args.disease_beta_json),
+        spatial_feature_cache=args.spatial_feature_cache,
     )
     print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0

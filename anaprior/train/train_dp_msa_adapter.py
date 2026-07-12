@@ -51,6 +51,11 @@ def load_dp_msa_cache(path: Path) -> dict[str, Any]:
     n = int(base_hmaps.shape[0])
     if disease_ids.shape[0] != n or subtype_ids.shape[0] != n:
         raise ValueError("disease_ids and subtype_ids must match cache row count")
+    disease_properties = payload.get("disease_properties")
+    if disease_properties is not None:
+        disease_properties = disease_properties.float()
+        if disease_properties.ndim != 2 or disease_properties.shape[0] != n:
+            raise ValueError("disease_properties must have shape [N,P]")
     return {
         **payload,
         "base_hmaps": base_hmaps,
@@ -59,21 +64,34 @@ def load_dp_msa_cache(path: Path) -> dict[str, Any]:
         "target_hmaps": normalize_heatmaps(target_hmaps),
         "disease_ids": disease_ids,
         "subtype_ids": subtype_ids,
+        **({"disease_properties": disease_properties} if disease_properties is not None else {}),
     }
 
 
 def _make_loader(payload: dict[str, Any], batch_size: int, seed: int) -> DataLoader:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
-    dataset = TensorDataset(
+    tensors = [
         payload["base_hmaps"],
         payload["region_maps"],
         payload["region_scores"],
         payload["target_hmaps"],
         payload["disease_ids"],
         payload["subtype_ids"],
-    )
+    ]
+    if "disease_properties" in payload:
+        tensors.append(payload["disease_properties"])
+    dataset = TensorDataset(*tensors)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator)
+
+
+def _unpack_batch(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    if len(batch) == 6:
+        base, maps, scores, target, disease_ids, subtype_ids = batch
+        return base, maps, scores, target, disease_ids, subtype_ids, None
+    if len(batch) == 7:
+        return batch
+    raise ValueError(f"unexpected DP-MSA batch size: {len(batch)}")
 
 
 def _loss_on_loader(
@@ -86,13 +104,15 @@ def _loss_on_loader(
     total = 0.0
     count = 0
     with torch.no_grad():
-        for base, maps, scores, target, disease_ids, subtype_ids in loader:
+        for batch in loader:
+            base, maps, scores, target, disease_ids, subtype_ids, disease_properties = _unpack_batch(batch)
             out = model(
                 base.to(device),
                 maps.to(device),
                 scores.to(device),
                 disease_ids.to(device),
                 subtype_ids.to(device),
+                disease_properties=disease_properties.to(device) if disease_properties is not None else None,
             )
             loss = F.mse_loss(out.final_heatmap, target.to(device))
             loss = loss + float(residual_l1_weight) * out.residual_map.abs().mean()
@@ -129,6 +149,9 @@ def train_dp_msa_adapter(
     torch_device = torch.device(device)
     train_payload = load_dp_msa_cache(train_cache)
     valid_payload = load_dp_msa_cache(valid_cache)
+    uses_disease_properties = "disease_properties" in train_payload and "disease_properties" in valid_payload
+    if ("disease_properties" in train_payload) != ("disease_properties" in valid_payload):
+        raise ValueError("train and valid caches must either both include disease_properties or both omit it")
     finding_vocab = {str(k): int(v) for k, v in train_payload["finding_vocab"].items()}
     subtype_vocab = {str(k): int(v) for k, v in train_payload["subtype_vocab"].items()}
     region_names = [str(region) for region in train_payload["region_names"]]
@@ -141,6 +164,12 @@ def train_dp_msa_adapter(
         "lambda_weight": float(lambda_weight),
         "residual_scale": 0.25,
     }
+    if uses_disease_properties:
+        train_prop_dim = int(train_payload["disease_properties"].shape[1])
+        valid_prop_dim = int(valid_payload["disease_properties"].shape[1])
+        if train_prop_dim != valid_prop_dim:
+            raise ValueError("train and valid disease_properties dimensions must match")
+        model_config["num_disease_properties"] = train_prop_dim
     model = DPMultiScaleSpatialAdapter(**model_config).to(torch_device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(learning_rate))
     train_loader = _make_loader(train_payload, batch_size=batch_size, seed=seed)
@@ -150,7 +179,8 @@ def train_dp_msa_adapter(
         model.train()
         weighted_loss = 0.0
         total = 0
-        for base, maps, scores, target, disease_ids, subtype_ids in train_loader:
+        for batch in train_loader:
+            base, maps, scores, target, disease_ids, subtype_ids, disease_properties = _unpack_batch(batch)
             optimizer.zero_grad(set_to_none=True)
             out = model(
                 base.to(torch_device),
@@ -158,6 +188,7 @@ def train_dp_msa_adapter(
                 scores.to(torch_device),
                 disease_ids.to(torch_device),
                 subtype_ids.to(torch_device),
+                disease_properties=disease_properties.to(torch_device) if disease_properties is not None else None,
             )
             loss = F.mse_loss(out.final_heatmap, target.to(torch_device))
             loss = loss + float(residual_l1_weight) * out.residual_map.abs().mean()
@@ -169,16 +200,16 @@ def train_dp_msa_adapter(
     final_valid_loss = _loss_on_loader(model, valid_loader, torch_device, residual_l1_weight=residual_l1_weight)
     outdir.mkdir(parents=True, exist_ok=True)
     checkpoint = outdir / "dp_msa_adapter.pt"
-    torch.save(
-        {
-            "model_state_dict": model.cpu().state_dict(),
-            "model_config": model_config,
-            "finding_vocab": finding_vocab,
-            "subtype_vocab": subtype_vocab,
-            "region_names": region_names,
-        },
-        checkpoint,
-    )
+    checkpoint_payload = {
+        "model_state_dict": model.cpu().state_dict(),
+        "model_config": model_config,
+        "finding_vocab": finding_vocab,
+        "subtype_vocab": subtype_vocab,
+        "region_names": region_names,
+    }
+    if uses_disease_properties:
+        checkpoint_payload["disease_property_names"] = tuple(str(name) for name in train_payload.get("disease_property_names", ()))
+    torch.save(checkpoint_payload, checkpoint)
     report_path = outdir / "train_report.json"
     report: dict[str, Any] = {
         "status": "ok",
@@ -192,6 +223,8 @@ def train_dp_msa_adapter(
         "num_train_rows": int(train_payload["base_hmaps"].shape[0]),
         "num_valid_rows": int(valid_payload["base_hmaps"].shape[0]),
         "num_regions": int(train_payload["region_maps"].shape[1]),
+        "uses_disease_properties": bool(uses_disease_properties),
+        "disease_property_names": list(train_payload.get("disease_property_names", ())) if uses_disease_properties else [],
         "epoch_losses": epoch_losses,
         "final_train_loss": float(epoch_losses[-1]),
         "final_valid_loss": float(final_valid_loss),

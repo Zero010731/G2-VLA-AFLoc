@@ -217,3 +217,59 @@ def test_stage_h_dp_msa_eval_server_script_contains_eval_command() -> None:
     assert "--method-name" in script
     assert "--lambda-override" in script
     assert "dp_msa_repair_summary.json" in script
+
+
+def test_stage_gh_dp_msa_v2_full_server_script_contains_end_to_end_pipeline() -> None:
+    script = Path("scripts/run_stage_gh_dp_msa_v2_full_server.sh").read_text(encoding="utf-8")
+
+    assert "set -euo pipefail" in script
+    assert "ANAPRIOR_OUTPUT_BASE" in script
+    assert "STAGE_C_ROOT" in script
+    assert "DP_MSA_CACHE_ROOT" in script
+    assert "DP_MSA_TRAIN_ROOT" in script
+    assert "DP_MSA_EVAL_ROOT" in script
+    assert "DP_MSA_HMAP_ROOT" in script
+    assert "DP_MSA_METRIC_ROOT" in script
+    assert "phrase_anatomy_dcem" in script
+    assert "dp_msa_v2_property_over_v3" in script
+    assert "SCORE_METHODS=\"${SCORE_METHODS:-baseline,${BASE_METHOD_NAME},${METHOD_NAME}}\"" in script
+    assert "anaprior.train.build_dp_msa_training_cache" in script
+    assert "anaprior.train.train_dp_msa_adapter" in script
+    assert "anaprior.eval.eval_mscxr_dp_msa_repair" in script
+    assert "anaprior.eval.score_mscxr_learned_repair_metrics" in script
+    assert "anaprior.eval.report_stage_c_results" in script
+    assert "--base-hmaps-npy" in script
+    assert "--base-method-name" in script
+    assert "--target-mix-beta" in script
+    assert "--method-name" in script
+    assert 'cp "${BASE_HMAPS_NPY}" "${DP_MSA_HMAP_ROOT}/${BASE_METHOD_NAME}/hmaps.npy"' in script
+    assert "--validation-gate-source-method" in script
+    assert "--validation-gate-fallback-method" in script
+    assert "VALIDATION_GATE_FALLBACK_METHOD" in script
+    assert "validation_gated_dp_msa_v2_property_over_v3" in script
+    assert "train_dp_msa_v0.pt" in script
+    assert "dp_msa_adapter.pt" in script
+    assert "learned_repair_decision.json" in script
+
+
+def test_stage_i_dense_dp_msa_full_server_script_contains_dense_pipeline() -> None:
+    script = Path("scripts/run_stage_i_dense_dp_msa_full_server.sh").read_text(encoding="utf-8")
+
+    assert "set -euo pipefail" in script
+    assert "AFLOC_HF_LOCAL_FILES_ONLY" in script
+    assert "AFLOC_BERT_TYPE" in script
+    assert "/mnt/zhangran/Bio_ClinicalBERT" in script
+    assert "DENSE_SPATIAL_CACHE" in script
+    assert "DENSE_CACHE_ROOT" in script
+    assert "DENSE_TRAIN_ROOT" in script
+    assert "DENSE_HMAP_ROOT" in script
+    assert "dense_dp_msa_over_v3" in script
+    assert "anaprior.features.extract_dp_msa_spatial_features" in script
+    assert "--bert-type" in script
+    assert "anaprior.train.build_dp_msa_training_cache" in script
+    assert "--spatial-feature-cache" in script
+    assert "anaprior.train.train_dense_dp_msa_adapter" in script
+    assert "anaprior.eval.eval_mscxr_dense_dp_msa_repair" in script
+    assert "dense_dp_msa_adapter.pt" in script
+    assert "anaprior.eval.score_mscxr_learned_repair_metrics" in script
+    assert "--validation-gate-fallback-method" in script

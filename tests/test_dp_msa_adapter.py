@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from anaprior.eval.disease_properties import DISEASE_PROPERTY_NAMES, disease_property_matrix
 from anaprior.models.dp_msa_adapter import DPMultiScaleSpatialAdapter, normalize_heatmaps
 
 
@@ -46,6 +47,35 @@ def test_dp_msa_adapter_outputs_heatmap_residual_and_branch_weights() -> None:
     assert float(out.final_heatmap.detach().max()) <= 1.0
 
 
+def test_dp_msa_adapter_uses_disease_property_vectors_for_v2_branches() -> None:
+    model = DPMultiScaleSpatialAdapter(
+        num_diseases=3,
+        num_subtypes=5,
+        num_regions=4,
+        num_disease_properties=len(DISEASE_PROPERTY_NAMES),
+        hidden_channels=8,
+        embedding_dim=6,
+        lambda_weight=0.25,
+    )
+    base_hmap, region_maps, region_scores, disease_ids, subtype_ids = _inputs()
+    disease_properties = disease_property_matrix(["Pneumothorax", "Edema"])
+
+    out = model(
+        base_hmap,
+        region_maps,
+        region_scores,
+        disease_ids,
+        subtype_ids,
+        disease_properties=disease_properties,
+    )
+
+    assert out.final_heatmap.shape == base_hmap.shape
+    assert out.residual_map.shape == base_hmap.shape
+    assert out.dense_match.shape == base_hmap.shape
+    assert out.branch_weights.shape == (2, 5)
+    assert torch.allclose(out.branch_weights.sum(dim=1), torch.ones(2), atol=1e-6)
+
+
 def test_dp_msa_lambda_zero_returns_normalized_baseline() -> None:
     model = DPMultiScaleSpatialAdapter(
         num_diseases=3,
@@ -68,3 +98,23 @@ def test_dp_msa_adapter_validates_region_count() -> None:
 
     with pytest.raises(ValueError, match="num_regions"):
         model(base_hmap, region_maps[:, :3], region_scores[:, :3], disease_ids, subtype_ids)
+
+
+def test_dp_msa_adapter_validates_disease_property_shape() -> None:
+    model = DPMultiScaleSpatialAdapter(
+        num_diseases=3,
+        num_subtypes=5,
+        num_regions=4,
+        num_disease_properties=len(DISEASE_PROPERTY_NAMES),
+    )
+    base_hmap, region_maps, region_scores, disease_ids, subtype_ids = _inputs()
+
+    with pytest.raises(ValueError, match="disease_properties"):
+        model(
+            base_hmap,
+            region_maps,
+            region_scores,
+            disease_ids,
+            subtype_ids,
+            disease_properties=torch.ones(2, len(DISEASE_PROPERTY_NAMES) - 1),
+        )
