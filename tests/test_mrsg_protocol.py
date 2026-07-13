@@ -44,6 +44,40 @@ def test_build_exclusion_set_accepts_coco_payload_and_explicit_ids() -> None:
     assert "files/p11/p11000001/s51000001/explicit-dicom.jpg" in exclusions.paths
 
 
+def test_exclusion_json_sources_fail_closed_and_valid_json_parses(tmp_path) -> None:
+    valid_json = tmp_path / "mscxr.json"
+    valid_json.write_text(
+        json.dumps(
+            {"images": [{"path": "files/p10/p10000001/s50000001/a.jpg"}]}
+        ),
+        encoding="utf-8",
+    )
+    malformed_json = tmp_path / "malformed.json"
+    malformed_json.write_text("{not-json", encoding="utf-8")
+
+    exclusions = build_mscxr_exclusion_set(str(valid_json))
+
+    assert exclusions.subjects == frozenset({"10000001"})
+    with pytest.raises((FileNotFoundError, ValueError)):
+        build_mscxr_exclusion_set(str(tmp_path / "missing.json"))
+    with pytest.raises(FileNotFoundError):
+        build_mscxr_exclusion_set(tmp_path / "also-missing.json")
+    with pytest.raises((json.JSONDecodeError, ValueError)):
+        build_mscxr_exclusion_set(malformed_json)
+
+
+def test_exclusion_record_rejects_explicit_ids_conflicting_with_path() -> None:
+    record = {
+        "subject_id": "11000002",
+        "study_id": "51000002",
+        "dicom_id": "different",
+        "path": "files/p11/p11000001/s51000001/a.jpg",
+    }
+
+    with pytest.raises(ValueError, match="conflicts with path"):
+        build_mscxr_exclusion_set([record])
+
+
 def test_protocol_excludes_any_matching_identity_or_normalized_path() -> None:
     rows = pd.DataFrame(
         [
@@ -119,6 +153,122 @@ def test_protocol_is_deterministic_and_keeps_patients_in_one_split() -> None:
 def test_protocol_rejects_missing_reports_and_spatial_supervision(rows, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         filter_and_split_mimic_rows(rows)
+
+
+@pytest.mark.parametrize(
+    "forbidden_key",
+    [
+        "ROI",
+        "roi-coordinates",
+        "coordinate",
+        "polygon",
+        "Contour",
+        "segmentation",
+        "key_points",
+        "points",
+        "spatial.map",
+        "BBOX",
+        "box",
+        "mask",
+        "region",
+        "oracle",
+        "DCEM",
+        "base-hmap",
+        "heatmap",
+    ],
+)
+def test_protocol_rejects_spatial_aliases_in_top_level_and_nested_keys(
+    forbidden_key: str,
+) -> None:
+    base = {
+        "path": "files/p11/p11000001/s51000001/a.jpg",
+        "report": "opacity",
+    }
+
+    with pytest.raises(ValueError, match="prohibited"):
+        filter_and_split_mimic_rows(pd.DataFrame([{**base, forbidden_key: "x"}]))
+    with pytest.raises(ValueError, match="prohibited"):
+        filter_and_split_mimic_rows(
+            pd.DataFrame([{**base, "metadata": {"items": [{forbidden_key: [1, 2]}]}}])
+        )
+
+
+def test_protocol_does_not_scan_report_text_for_spatial_aliases() -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "path": "files/p11/p11000001/s51000001/a.jpg",
+                "report": "No box, mask, ROI, or region annotation is available.",
+                "metadata": {"source": "report"},
+            }
+        ]
+    )
+
+    result = filter_and_split_mimic_rows(rows)
+
+    assert len(result.all_rows) == 1
+
+
+@pytest.mark.parametrize(
+    "rows, path_column",
+    [
+        (
+            pd.DataFrame(
+                [
+                    {
+                        "subject_id": "11000001",
+                        "study_id": "51000001",
+                        "dicom_id": "a",
+                        "report": "opacity",
+                    }
+                ]
+            ),
+            "path",
+        ),
+        (
+            pd.DataFrame(
+                [
+                    {
+                        "path": "   ",
+                        "subject_id": "11000001",
+                        "study_id": "51000001",
+                        "dicom_id": "a",
+                        "report": "opacity",
+                    }
+                ]
+            ),
+            "path",
+        ),
+        (
+            pd.DataFrame(
+                [
+                    {
+                        "path": "not-a-mimic-path.jpg",
+                        "subject_id": "11000001",
+                        "study_id": "51000001",
+                        "dicom_id": "not-a-mimic-path",
+                        "report": "opacity",
+                    }
+                ]
+            ),
+            "path",
+        ),
+        (
+            pd.DataFrame(
+                [
+                    {
+                        "path": "files/p11/p11000001/s51000001/a.jpg",
+                        "report": "opacity",
+                    }
+                ]
+            ),
+            "image_path",
+        ),
+    ],
+)
+def test_protocol_requires_existing_nonblank_mimic_path_column(rows, path_column: str) -> None:
+    with pytest.raises(ValueError, match="path"):
+        filter_and_split_mimic_rows(rows, path_column=path_column)
 
 
 def test_protocol_rejects_unparseable_identity_and_invalid_fraction() -> None:

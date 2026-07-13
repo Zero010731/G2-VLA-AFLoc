@@ -19,8 +19,20 @@ _FORBIDDEN_COLUMN_PARTS = frozenset(
         "bbox",
         "box",
         "boxes",
+        "contour",
+        "contours",
+        "coordinate",
+        "coordinates",
+        "keypoint",
+        "keypoints",
         "mask",
         "masks",
+        "point",
+        "points",
+        "polygon",
+        "polygons",
+        "roi",
+        "rois",
         "segmentation",
         "region",
         "regions",
@@ -150,7 +162,9 @@ def _load_exclusion_records(
             return _load_exclusion_records(json.load(handle))
     if isinstance(source, str):
         candidate = Path(source)
-        if candidate.suffix.lower() == ".json" and candidate.is_file():
+        if candidate.suffix.lower() == ".json":
+            if not candidate.is_file():
+                raise FileNotFoundError(candidate)
             with candidate.open("r", encoding="utf-8") as handle:
                 return _load_exclusion_records(json.load(handle))
         return [source]
@@ -186,6 +200,21 @@ def build_mscxr_exclusion_set(
         explicit_subject = _normalize_identifier(explicit.get("subject_id"), "p")
         explicit_study = _normalize_identifier(explicit.get("study_id"), "s")
         explicit_dicom = _normalize_dicom(explicit.get("dicom_id"))
+        parsed_paths = []
+        for raw_path in record_paths:
+            normalized_path = normalize_mimic_path(raw_path)
+            if normalized_path:
+                parsed_paths.append((normalized_path, identity_from_path(normalized_path)))
+
+        for _, path_identity in parsed_paths:
+            for name, explicit_value, path_value in (
+                ("subject_id", explicit_subject, path_identity.subject_id),
+                ("study_id", explicit_study, path_identity.study_id),
+                ("dicom_id", explicit_dicom, path_identity.dicom_id),
+            ):
+                if explicit_value and path_value and explicit_value != path_value:
+                    raise ValueError(f"MS-CXR {name} conflicts with path identity")
+
         if explicit_subject:
             subjects.add(explicit_subject)
         if explicit_study:
@@ -193,12 +222,8 @@ def build_mscxr_exclusion_set(
         if explicit_dicom:
             dicoms.add(explicit_dicom)
 
-        for raw_path in record_paths:
-            normalized_path = normalize_mimic_path(raw_path)
-            if not normalized_path:
-                continue
+        for normalized_path, identity in parsed_paths:
             paths.add(normalized_path)
-            identity = identity_from_path(normalized_path)
             if identity.subject_id:
                 subjects.add(identity.subject_id)
             if identity.study_id:
@@ -227,18 +252,60 @@ def patient_split(subject_id: str, valid_fraction: float, seed: int) -> str:
     return "valid" if unit < valid_fraction else "train"
 
 
+def _is_forbidden_key(key: object) -> bool:
+    name = str(key).strip().lower()
+    compact = re.sub(r"[^a-z0-9]+", "", name)
+    parts = set(filter(None, re.split(r"[^a-z0-9]+", name)))
+    if parts & _FORBIDDEN_COLUMN_PARTS:
+        return True
+    if any(
+        token in compact
+        for token in (
+            "basehmap",
+            "boundingbox",
+            "contour",
+            "coordinate",
+            "dcem",
+            "heatmap",
+            "keypoint",
+            "oracle",
+            "polygon",
+            "regionpredictor",
+            "scenegraph",
+            "segmentation",
+            "spatialannotation",
+        )
+    ):
+        return True
+    return compact.startswith("spatial") and "map" in compact
+
+
 def _forbidden_columns(columns: Iterable[object]) -> List[str]:
+    return [str(column) for column in columns if _is_forbidden_key(column)]
+
+
+def _forbidden_structured_keys(value: object, prefix: str) -> List[str]:
     forbidden = []
-    for column in columns:
-        name = str(column).strip().lower()
-        compact = re.sub(r"[^a-z0-9]+", "", name)
-        parts = set(filter(None, re.split(r"[^a-z0-9]+", name)))
-        if parts & _FORBIDDEN_COLUMN_PARTS or any(
-            token in compact
-            for token in ("scenegraph", "regionpredictor", "spatialannotation", "oracle", "dcem")
-        ):
-            forbidden.append(str(column))
+    if isinstance(value, Mapping):
+        for key, nested_value in value.items():
+            key_path = f"{prefix}.{key}" if prefix else str(key)
+            if _is_forbidden_key(key):
+                forbidden.append(key_path)
+            forbidden.extend(_forbidden_structured_keys(nested_value, key_path))
+    elif isinstance(value, (list, tuple, set)):
+        for index, nested_value in enumerate(value):
+            forbidden.extend(_forbidden_structured_keys(nested_value, f"{prefix}[{index}]"))
     return forbidden
+
+
+def _forbidden_row_keys(rows: pd.DataFrame, report_column: str) -> List[str]:
+    forbidden = _forbidden_columns(rows.columns)
+    for column in rows.columns:
+        if column == report_column:
+            continue
+        for value in rows[column]:
+            forbidden.extend(_forbidden_structured_keys(value, str(column)))
+    return sorted(set(forbidden))
 
 
 def _normalized_exclusions(
@@ -285,7 +352,13 @@ def _matches_exclusion(
 def _identity_from_row(row: pd.Series, path_column: str) -> Tuple[MIMICIdentity, str]:
     raw_path = row.get(path_column, "")
     normalized_path = normalize_mimic_path(raw_path)
+    if not normalized_path:
+        raise ValueError("Every MRSG row must have a nonblank normalized image path")
     parsed = identity_from_path(normalized_path)
+    if not all((parsed.subject_id, parsed.study_id, parsed.dicom_id)):
+        raise ValueError(
+            "Every MRSG image path must contain a valid MIMIC subject, study, and DICOM identity"
+        )
     explicit_subject = _normalize_identifier(row.get("subject_id"), "p")
     explicit_study = _normalize_identifier(row.get("study_id"), "s")
     explicit_dicom = _normalize_dicom(row.get("dicom_id"))
@@ -296,15 +369,7 @@ def _identity_from_row(row: pd.Series, path_column: str) -> Tuple[MIMICIdentity,
     ):
         if explicit and path_value and explicit != path_value:
             raise ValueError(f"{name} conflicts with path identity")
-    subject = explicit_subject or parsed.subject_id
-    study = explicit_study or parsed.study_id
-    dicom = explicit_dicom or parsed.dicom_id
-    identity = MIMICIdentity(subject, study, dicom)
-    if not all((identity.subject_id, identity.study_id, identity.dicom_id)):
-        raise ValueError(
-            "Every MRSG row must have a parseable subject, study, and DICOM identity"
-        )
-    return identity, normalized_path
+    return parsed, normalized_path
 
 
 def filter_and_split_mimic_rows(
@@ -324,11 +389,13 @@ def filter_and_split_mimic_rows(
         raise TypeError("rows must be a pandas DataFrame")
     if not 0.0 < valid_fraction < 1.0:
         raise ValueError("valid_fraction must be between 0 and 1")
-    forbidden = _forbidden_columns(rows.columns)
-    if forbidden:
-        raise ValueError(f"MRSG rows contain prohibited supervision columns: {forbidden}")
+    if path_column not in rows.columns:
+        raise ValueError(f"MRSG rows are missing required image path column: {path_column}")
     if report_column not in rows.columns:
         raise ValueError(f"MRSG rows are missing required report column: {report_column}")
+    forbidden = _forbidden_row_keys(rows, report_column)
+    if forbidden:
+        raise ValueError(f"MRSG rows contain prohibited supervision keys: {forbidden}")
     missing_reports = rows[report_column].map(
         lambda value: _is_missing(value) or not str(value).strip()
     )
