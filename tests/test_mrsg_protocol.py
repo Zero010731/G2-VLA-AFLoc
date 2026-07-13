@@ -209,6 +209,20 @@ def test_protocol_does_not_scan_report_text_for_spatial_aliases() -> None:
     assert len(result.all_rows) == 1
 
 
+def test_protocol_rejects_structured_report_values() -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "path": "files/p11/p11000001/s51000001/a.jpg",
+                "report": {"text": "opacity", "bbox": [0, 0, 1, 1]},
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="strings"):
+        filter_and_split_mimic_rows(rows)
+
+
 @pytest.mark.parametrize(
     "rows, path_column",
     [

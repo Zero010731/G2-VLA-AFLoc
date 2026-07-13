@@ -396,9 +396,12 @@ def filter_and_split_mimic_rows(
     forbidden = _forbidden_row_keys(rows, report_column)
     if forbidden:
         raise ValueError(f"MRSG rows contain prohibited supervision keys: {forbidden}")
-    missing_reports = rows[report_column].map(
-        lambda value: _is_missing(value) or not str(value).strip()
+    non_string_reports = rows[report_column].map(
+        lambda value: not isinstance(value, str)
     )
+    if bool(non_string_reports.any()):
+        raise ValueError(f"MRSG report values must be strings: {report_column}")
+    missing_reports = rows[report_column].map(lambda value: not value.strip())
     if bool(missing_reports.any()):
         raise ValueError(f"MRSG rows contain missing report text in column: {report_column}")
 
