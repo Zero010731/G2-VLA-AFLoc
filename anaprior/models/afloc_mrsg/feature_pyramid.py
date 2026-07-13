@@ -109,10 +109,16 @@ class LocalityAlignedFeaturePyramid(nn.Module):
     ) -> PyramidOutput:
         target_size = self._validate_inputs(image_features, patch_mask)
         projected = self._project_sources(image_features, target_size)
+        masked_projected = self._project_sources(
+            image_features,
+            target_size,
+            patch_mask=patch_mask,
+        )
         edge_features = self._compute_edge_features(image_features.image_gray.detach(), target_size)
         fused_input = self._fuse_sources(projected, edge_features)
         fused = self._encode_grid(fused_input)
-        masked_context = self._encode_grid(self._apply_patch_mask(fused_input, patch_mask))
+        masked_fused_input = self._fuse_sources(masked_projected, edge_features)
+        masked_context = self._encode_grid(self._apply_patch_mask(masked_fused_input, patch_mask))
         source_targets = {
             name: tensor.detach()
             for name, tensor in projected.items()
@@ -173,10 +179,13 @@ class LocalityAlignedFeaturePyramid(nn.Module):
         self,
         image_features: AFLocFeatureBatch,
         target_size: Tuple[int, int],
+        patch_mask: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         projected = {}
         for name in self.source_names:
             tensor = getattr(image_features, f"img_emb_{name}").detach()
+            if patch_mask is not None:
+                tensor = self._replace_masked_source_positions(tensor, patch_mask)
             projected_tensor = self.projections[name](tensor)
             if tuple(projected_tensor.shape[-2:]) != target_size:
                 projected_tensor = F.interpolate(
@@ -187,6 +196,48 @@ class LocalityAlignedFeaturePyramid(nn.Module):
                 )
             projected[name] = projected_tensor
         return projected
+
+    def _replace_masked_source_positions(
+        self,
+        source: torch.Tensor,
+        patch_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        source_mask = self._source_mask_from_target_mask(
+            patch_mask,
+            source.shape[-2:],
+        ).to(dtype=source.dtype)
+        return source * (1.0 - source_mask)
+
+    def _source_mask_from_target_mask(
+        self,
+        patch_mask: torch.Tensor,
+        source_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        if tuple(source_size) == tuple(patch_mask.shape[-2:]):
+            return patch_mask
+
+        source_height, source_width = source_size
+        num_cells = source_height * source_width
+        basis = torch.eye(
+            num_cells,
+            device=patch_mask.device,
+            dtype=torch.float32,
+        ).reshape(num_cells, 1, source_height, source_width)
+        contributions = F.interpolate(
+            basis,
+            size=patch_mask.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).flatten(1)
+        contribution_mask = (contributions > 0).to(dtype=torch.float32)
+        target_flat = patch_mask.flatten(2).to(dtype=torch.float32)
+        source_flat = torch.matmul(target_flat, contribution_mask.transpose(0, 1))
+        return source_flat.gt(0).reshape(
+            patch_mask.shape[0],
+            1,
+            source_height,
+            source_width,
+        )
 
     def _compute_edge_features(
         self,
@@ -249,7 +300,7 @@ def masked_patch_distillation_loss(
     mask = patch_mask.to(dtype=output.fused.dtype)
     masked_positions = mask.sum()
     if masked_positions.item() == 0:
-        return output.fused.new_zeros(())
+        return output.fused.sum() * 0
 
     losses = []
     for name in ("l2", "l", "lf"):

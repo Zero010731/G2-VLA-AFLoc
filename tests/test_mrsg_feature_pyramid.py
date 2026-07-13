@@ -91,6 +91,58 @@ def test_masked_reconstruction_loss_is_zero_without_mask_and_positive_with_mask(
     assert masked_patch_distillation_loss(filled_output, filled_mask).item() > 0.0
 
 
+def test_masked_predictor_is_invariant_to_masked_source_values() -> None:
+    torch.manual_seed(11)
+    module = LocalityAlignedFeaturePyramid((32, 64, 128), feature_dim=16, num_heads=4)
+    patch_mask = torch.zeros(1, 1, 16, 16, dtype=torch.bool)
+    patch_mask[:, :, 4:12, 4:12] = True
+    fake_batch = fake_image_features()
+    base_features = AFLocFeatureBatch(
+        img_emb_l2=fake_batch.img_emb_l2[:1].clone(),
+        img_emb_l=fake_batch.img_emb_l[:1].clone(),
+        img_emb_lf=fake_batch.img_emb_lf[:1].clone(),
+        image_gray=fake_batch.image_gray[:1].clone(),
+    )
+    changed_features = AFLocFeatureBatch(
+        img_emb_l2=base_features.img_emb_l2.clone(),
+        img_emb_l=base_features.img_emb_l.clone(),
+        img_emb_lf=base_features.img_emb_lf.clone(),
+        image_gray=base_features.image_gray.clone(),
+    )
+
+    for name in ("l2", "l", "lf"):
+        tensor = getattr(changed_features, f"img_emb_{name}")
+        source_mask = module._source_mask_from_target_mask(patch_mask, tensor.shape[-2:])
+        tensor[source_mask.expand_as(tensor)] += 1000.0
+
+    module.eval()
+    with torch.no_grad():
+        base_output = module(base_features, patch_mask=patch_mask)
+        changed_output = module(changed_features, patch_mask=patch_mask)
+
+    assert not torch.allclose(base_output.source_targets["l"], changed_output.source_targets["l"])
+    for name in ("l2", "l", "lf"):
+        assert torch.allclose(
+            base_output.masked_prediction[name],
+            changed_output.masked_prediction[name],
+        )
+
+
+def test_zero_mask_loss_supports_backward_with_zero_gradients() -> None:
+    module = LocalityAlignedFeaturePyramid((32, 64, 128), feature_dim=16, num_heads=4)
+    features = make_trainable_features()
+    empty_mask = torch.zeros(2, 1, 16, 16, dtype=torch.bool)
+
+    output = module(features, patch_mask=empty_mask)
+    loss = masked_patch_distillation_loss(output, empty_mask)
+    loss.backward()
+
+    assert loss.item() == 0.0
+    assert module.projections["l2"].weight.grad is not None
+    assert torch.count_nonzero(module.projections["l2"].weight.grad) == 0
+    assert module.predictors["l2"][-1].weight.grad is None
+
+
 def test_eval_forward_is_deterministic() -> None:
     torch.manual_seed(7)
     module = LocalityAlignedFeaturePyramid((32, 64, 128), feature_dim=16, num_heads=4)
