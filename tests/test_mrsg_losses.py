@@ -129,6 +129,78 @@ def test_compute_mrsg_loss_exposes_exactly_four_top_level_groups() -> None:
     assert not any(key.startswith("w_") for key in loss.diagnostics)
 
 
+def test_compute_mrsg_loss_requires_explicit_target_when_grounding_weight_active() -> None:
+    student = _student_output(batch=1)
+
+    with pytest.raises(ValueError, match="target_phrase"):
+        compute_mrsg_loss(
+            student=student,
+            positive_scores=torch.tensor([0.7], requires_grad=True),
+            negative_scores=torch.tensor([[0.2]], requires_grad=True),
+            pyramid=student,
+            teacher_target=None,
+            config=LossWeights(w_teacher=0.0, w_mask=0.0, w_query=0.0),
+        )
+
+
+def test_explicit_afloc_target_changes_grounding_loss_and_reconstruction_gradients() -> None:
+    positive = torch.tensor([0.75], requires_grad=True)
+    negative = torch.tensor([[0.20, 0.35]], requires_grad=True)
+    target_a = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    target_b = torch.tensor([[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]])
+
+    def build_student() -> MRSGOutput:
+        student = _student_output(batch=1)
+        query_reconstructed_phrase = torch.tensor(
+            [[[0.8, 0.1, 0.1, 0.0, 0.0, 0.0]] * 4],
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        return MRSGOutput(
+            final_heatmap=student.final_heatmap,
+            query_heatmaps=student.query_heatmaps,
+            query_route_weights=student.query_route_weights,
+            query_reliability=student.query_reliability,
+            phrase_patch_logits=student.phrase_patch_logits,
+            masked_predictions=student.masked_predictions,
+            source_targets=student.source_targets,
+            patch_mask=student.patch_mask,
+            query_reconstructed_phrase=query_reconstructed_phrase,
+            query_patch_gates=student.query_patch_gates,
+        )
+
+    student_a = build_student()
+    loss_a = compute_mrsg_loss(
+        student=student_a,
+        positive_scores=positive,
+        negative_scores=negative,
+        pyramid=student_a,
+        teacher_target=None,
+        config=LossWeights(w_teacher=0.0, w_mask=0.0, w_query=0.0),
+        target_phrase=target_a,
+    )
+    loss_a.total.backward()
+    grad_a = student_a.query_reconstructed_phrase.grad.detach().clone()
+
+    positive_b = positive.detach().clone().requires_grad_(True)
+    negative_b = negative.detach().clone().requires_grad_(True)
+    student_b = build_student()
+    loss_b = compute_mrsg_loss(
+        student=student_b,
+        positive_scores=positive_b,
+        negative_scores=negative_b,
+        pyramid=student_b,
+        teacher_target=None,
+        config=LossWeights(w_teacher=0.0, w_mask=0.0, w_query=0.0),
+        target_phrase=target_b,
+    )
+    loss_b.total.backward()
+    grad_b = student_b.query_reconstructed_phrase.grad.detach().clone()
+
+    assert not torch.isclose(loss_a.total.detach(), loss_b.total.detach())
+    assert not torch.allclose(grad_a, grad_b)
+
+
 def test_query_regularization_uses_exact_equal_component_ratio() -> None:
     query_maps = torch.tensor(
         [
@@ -228,6 +300,54 @@ def test_group_losses_produce_finite_gradients_without_target_gradients() -> Non
         assert tensor.grad is None
     for tensor in targets.values():
         assert tensor.grad is None
+
+
+def test_grounding_loss_uses_negative_mask_for_padding_invariant_counterfactuals() -> None:
+    reconstructed = torch.tensor([[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]], requires_grad=True)
+    target_phrase = torch.tensor([[1.0, 0.0]], requires_grad=True)
+    positive = torch.tensor([0.8], requires_grad=True)
+
+    compact = cross_modal_grounding_loss(
+        positive_scores=positive,
+        negative_scores=torch.tensor([[0.4]], requires_grad=True),
+        negative_mask=torch.tensor([[True]]),
+        reconstructed_phrase=reconstructed,
+        target_phrase=target_phrase,
+        margin=0.2,
+    )
+    padded = cross_modal_grounding_loss(
+        positive_scores=positive.detach().clone().requires_grad_(True),
+        negative_scores=torch.tensor([[0.4, 0.95, 0.05]], requires_grad=True),
+        negative_mask=torch.tensor([[True, False, False]]),
+        reconstructed_phrase=reconstructed.detach().clone().requires_grad_(True),
+        target_phrase=target_phrase,
+        margin=0.2,
+    )
+
+    assert torch.isclose(compact.detach(), padded.detach())
+
+
+def test_grounding_loss_handles_empty_negatives_without_breaking_autograd() -> None:
+    positive = torch.tensor([0.8], requires_grad=True)
+    reconstructed = torch.tensor(
+        [[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]],
+        requires_grad=True,
+    )
+    loss = cross_modal_grounding_loss(
+        positive_scores=positive,
+        negative_scores=torch.empty(1, 0, requires_grad=True),
+        negative_mask=torch.empty(1, 0, dtype=torch.bool),
+        reconstructed_phrase=reconstructed,
+        target_phrase=torch.tensor([[0.0, 1.0]], requires_grad=True),
+        margin=0.2,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss.detach())
+    assert positive.grad is not None
+    assert reconstructed.grad is not None
+    assert positive.grad.abs().sum().item() > 0.0
+    assert reconstructed.grad.abs().sum().item() > 0.0
 
 
 def test_absent_and_zero_confidence_teacher_are_backward_safe() -> None:

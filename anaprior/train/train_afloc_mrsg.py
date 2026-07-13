@@ -19,7 +19,11 @@ from anaprior.data.mrsg_dataset import MRSGDataset
 from anaprior.features.afloc_mrsg_encoder import FrozenAFLocMRSGEncoder
 from anaprior.models.afloc_mrsg import AFLocMRSG, MRSGConfig
 from anaprior.models.afloc_mrsg.diagnostics import collect_mrsg_diagnostics, evaluate_phase_gate
-from anaprior.models.afloc_mrsg.losses import MRSGGroupedLoss, compute_mrsg_loss
+from anaprior.models.afloc_mrsg.losses import (
+    MRSGGroupedLoss,
+    compute_mrsg_loss,
+    teacher_equivariance_loss,
+)
 from anaprior.models.afloc_mrsg.teacher import MRSGTeacher, TeacherTarget, teacher_confidence, transform_heatmap
 
 
@@ -28,6 +32,11 @@ PHASE_CHECKPOINT_NAMES = {
     "locality": "mrsg_phase_a.pt",
     "grounding": "mrsg_phase_b.pt",
     "consistency": "mrsg_phase_c.pt",
+}
+LATEST_CHECKPOINT_NAMES = {
+    "locality": "mrsg_phase_a_latest.pt",
+    "grounding": "mrsg_phase_b_latest.pt",
+    "consistency": "mrsg_phase_c_latest.pt",
 }
 REQUIRED_PREVIOUS_PHASE = {
     "locality": None,
@@ -63,6 +72,58 @@ def _sha256_file(path: Path | None) -> str:
     if path is None:
         return hashlib.sha256(b"").hexdigest()
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _capture_rng_state() -> dict[str, Any]:
+    return {
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+        "torch_rng_state": torch.random.get_rng_state().detach().cpu(),
+    }
+
+
+def _restore_rng_state(payload: Mapping[str, Any]) -> None:
+    if "python_random_state" in payload:
+        random.setstate(payload["python_random_state"])
+    if "numpy_random_state" in payload:
+        np.random.set_state(payload["numpy_random_state"])
+    if "torch_rng_state" in payload:
+        torch.random.set_rng_state(payload["torch_rng_state"])
+
+
+def _validate_protocol_manifest(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        raise ValueError("protocol_manifest is required")
+    if not path.exists():
+        raise FileNotFoundError(f"protocol_manifest not found: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"protocol_manifest is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("protocol_manifest must contain a JSON object")
+
+    uses_mscxr_annotations = bool(payload.get("uses_mscxr_annotations", False))
+    uses_spatial_annotations = bool(payload.get("uses_spatial_annotations", False))
+    uses_dcem = bool(payload.get("uses_dcem", False))
+    sanity = payload.get("sanity")
+    if not isinstance(sanity, dict):
+        raise ValueError("protocol_manifest must include a sanity object")
+    mscxr_overlap = int(sanity.get("mscxr_overlap", 0))
+    train_valid_overlap = int(sanity.get("train_valid_subject_overlap", 0))
+    if uses_mscxr_annotations or uses_spatial_annotations or uses_dcem:
+        raise ValueError("protocol_manifest must certify box-free, non-DCEM training only")
+    if mscxr_overlap != 0 or train_valid_overlap != 0:
+        raise ValueError("protocol_manifest sanity overlaps must be zero")
+    return {
+        "path": str(path),
+        "sha256": _sha256_file(path),
+        "uses_mscxr_annotations": uses_mscxr_annotations,
+        "uses_spatial_annotations": uses_spatial_annotations,
+        "uses_dcem": uses_dcem,
+        "mscxr_overlap": mscxr_overlap,
+        "train_valid_subject_overlap": train_valid_overlap,
+    }
 
 
 def _load_jsonl_rows(path: Path) -> list[dict[str, Any]]:
@@ -184,6 +245,12 @@ def _mrsg_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         else torch.tensor([bool(item["equivariance_transform"][key]) for item in batch])
         for key in batch[0]["equivariance_transform"]
     }
+    collated["relative_equivariance_transform"] = {
+        key: torch.tensor([int(item["relative_equivariance_transform"][key]) for item in batch])
+        if key != "horizontal_flip"
+        else torch.tensor([bool(item["relative_equivariance_transform"][key]) for item in batch])
+        for key in batch[0]["relative_equivariance_transform"]
+    }
     return collated
 
 
@@ -297,10 +364,21 @@ def _negative_scores(
     negative_phrases: Sequence[Sequence[str]],
     disease_descriptions: Sequence[str],
     device: torch.device,
-) -> torch.Tensor:
-    max_negatives = max(len(items) for items in negative_phrases)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = len(negative_phrases)
+    max_negatives = max((len(items) for items in negative_phrases), default=0)
+    if max_negatives == 0:
+        return (
+            torch.zeros(batch_size, 0, device=device),
+            torch.zeros(batch_size, 0, dtype=torch.bool, device=device),
+        )
     rows = []
+    masks = []
     for batch_index, phrases in enumerate(negative_phrases):
+        if not phrases:
+            rows.append(torch.zeros(max_negatives, device=device))
+            masks.append(torch.zeros(max_negatives, dtype=torch.bool, device=device))
+            continue
         description = [disease_descriptions[batch_index]] * len(phrases)
         phrase_features = _encode_batch_phrases(
             afloc_encoder,
@@ -317,11 +395,39 @@ def _negative_scores(
         with torch.set_grad_enabled(any(parameter.requires_grad for parameter in model.parameters())):
             negative_output = model(repeated_features, phrase_features)
         scores = _score_output(negative_output)
+        mask = torch.ones(scores.shape[0], dtype=torch.bool, device=scores.device)
         if scores.shape[0] < max_negatives:
-            pad = scores[-1:].expand(max_negatives - scores.shape[0])
+            pad = torch.zeros(max_negatives - scores.shape[0], device=scores.device, dtype=scores.dtype)
             scores = torch.cat([scores, pad], dim=0)
+            mask = torch.cat(
+                [
+                    mask,
+                    torch.zeros(max_negatives - mask.shape[0], dtype=torch.bool, device=scores.device),
+                ],
+                dim=0,
+            )
         rows.append(scores)
-    return torch.stack(rows, dim=0)
+        masks.append(mask)
+    return torch.stack(rows, dim=0), torch.stack(masks, dim=0)
+
+
+def _teacher_negative_scores(
+    positive_scores: torch.Tensor,
+    negative_scores: torch.Tensor,
+    negative_mask: torch.Tensor,
+) -> torch.Tensor:
+    if negative_scores.shape[1] == 0:
+        return positive_scores.unsqueeze(1) + 1.0
+    filled = torch.where(
+        negative_mask,
+        negative_scores,
+        torch.zeros_like(negative_scores),
+    )
+    invalid_rows = ~negative_mask.any(dim=1)
+    if invalid_rows.any():
+        filled = filled.clone()
+        filled[invalid_rows] = positive_scores[invalid_rows].unsqueeze(1) + 1.0
+    return filled
 
 
 def _build_teacher_target(
@@ -331,6 +437,7 @@ def _build_teacher_target(
     batch: dict[str, Any],
     positive_scores: torch.Tensor,
     negative_scores: torch.Tensor,
+    negative_mask: torch.Tensor,
 ) -> TeacherTarget:
     aligned_final = []
     aligned_queries = []
@@ -358,15 +465,19 @@ def _build_teacher_target(
     query_heatmaps = torch.cat(aligned_queries, dim=0)
     confidence = teacher_confidence(
         scale_heatmaps=(
-            weak_output.final_heatmap.detach(),
-            weak_output.query_heatmaps.detach().mean(dim=1, keepdim=True),
+            final_heatmap.detach(),
+            query_heatmaps.detach().mean(dim=1, keepdim=True),
         ),
         weak_heatmap=final_heatmap.detach(),
         strong_heatmap=student_equiv_output.final_heatmap.detach(),
         teacher_route_weights=weak_output.route_weights.detach(),
         student_route_weights=student_equiv_output.query_route_weights.detach(),
         positive_scores=positive_scores.detach(),
-        negative_scores=negative_scores.detach(),
+        negative_scores=_teacher_negative_scores(
+            positive_scores.detach(),
+            negative_scores.detach(),
+            negative_mask.detach(),
+        ),
         margin=0.2,
     )
     return TeacherTarget(
@@ -381,7 +492,10 @@ def teacher_conf_transform(batch: dict[str, Any], index: int):
     from anaprior.data.mrsg_dataset import geometry_transform_from_metadata
 
     return geometry_transform_from_metadata(
-        {name: tensor[index] for name, tensor in batch["equivariance_transform"].items()}
+        {
+            name: tensor[index]
+            for name, tensor in batch["relative_equivariance_transform"].items()
+        }
     )
 
 
@@ -396,7 +510,7 @@ def _batch_forward_and_loss(
     step: int,
     weights: Mapping[str, float],
     teacher: MRSGTeacher | None,
-) -> tuple[MRSGGroupedLoss, Any, torch.Tensor, torch.Tensor, TeacherTarget | None]:
+) -> tuple[MRSGGroupedLoss, Any, torch.Tensor, torch.Tensor, torch.Tensor, TeacherTarget | None]:
     strong_images = batch["strong_image"].to(device)
     weak_images = batch["weak_image"].to(device)
     equiv_images = batch["equivariance_image"].to(device)
@@ -420,8 +534,9 @@ def _batch_forward_and_loss(
     teacher_target = None
     if phase == "locality":
         negative_scores = (positive_scores.detach().unsqueeze(1) * 0.5).clamp(0.0, 1.0)
+        negative_mask = torch.ones_like(negative_scores, dtype=torch.bool)
     else:
-        negative_scores = _negative_scores(
+        negative_scores, negative_mask = _negative_scores(
             model=model,
             afloc_encoder=afloc_encoder,
             image_features=image_features,
@@ -431,6 +546,7 @@ def _batch_forward_and_loss(
         )
         negative_scores = (negative_scores - 0.05).clamp(0.0, 1.0)
 
+    student_for_teacher = output
     if phase == "consistency":
         assert teacher is not None
         weak_features = _encode_batch_images(afloc_encoder, weak_images)
@@ -447,37 +563,74 @@ def _batch_forward_and_loss(
             batch["disease_description"],
             device=device,
         )
+        student_for_teacher = model(equiv_features, equiv_phrases)
+        equiv_positive_scores = (_score_output(student_for_teacher) + 0.05).clamp(0.0, 1.0)
+        equiv_negative_scores, equiv_negative_mask = _negative_scores(
+            model=model,
+            afloc_encoder=afloc_encoder,
+            image_features=equiv_features,
+            negative_phrases=batch["equivariance_negative_phrases"],
+            disease_descriptions=batch["disease_description"],
+            device=device,
+        )
+        equiv_negative_scores = (equiv_negative_scores - 0.05).clamp(0.0, 1.0)
         with torch.no_grad():
             weak_output = teacher(weak_features, weak_phrases)
-        student_equiv_output = model(equiv_features, equiv_phrases)
         teacher_target = _build_teacher_target(
             weak_output=weak_output,
-            student_equiv_output=student_equiv_output,
+            student_equiv_output=student_for_teacher,
             batch=batch,
-            positive_scores=positive_scores,
-            negative_scores=negative_scores,
+            positive_scores=equiv_positive_scores,
+            negative_scores=equiv_negative_scores,
+            negative_mask=equiv_negative_mask,
         )
 
     loss = compute_mrsg_loss(
         student=output,
         positive_scores=positive_scores,
         negative_scores=negative_scores,
+        negative_mask=negative_mask,
         pyramid=output,
-        teacher_target=teacher_target,
+        teacher_target=None if phase == "consistency" else teacher_target,
         config=weights,
+        target_phrase=phrase_features.sentence_embedding.detach(),
     )
-    return loss, output, positive_scores, negative_scores, teacher_target
+    if phase == "consistency":
+        teacher_loss = teacher_equivariance_loss(
+            student_for_teacher.final_heatmap,
+            student_for_teacher.query_heatmaps,
+            teacher_target,
+        )
+        total = (
+            float(weights["w_ground"]) * loss.grounding
+            + float(weights["w_teacher"]) * teacher_loss
+            + float(weights["w_mask"]) * loss.mask
+            + float(weights["w_query"]) * loss.query
+        )
+        diagnostics = dict(loss.diagnostics)
+        diagnostics["teacher"] = float(teacher_loss.detach().cpu().item())
+        loss = MRSGGroupedLoss(
+            total=total,
+            grounding=loss.grounding,
+            teacher=teacher_loss,
+            mask=loss.mask,
+            query=loss.query,
+            diagnostics=diagnostics,
+        )
+    return loss, output, positive_scores, negative_scores, negative_mask, teacher_target
 
 
 def _phase_payload(
     *,
     checkpoint_path: Path,
+    checkpoint_role: str,
     model: AFLocMRSG,
     teacher: MRSGTeacher | None,
     optimizer: torch.optim.Optimizer,
     phase: str,
     weights: Mapping[str, float],
-    protocol_manifest: Path | None,
+    protocol_facts: Mapping[str, Any],
+    protocol_manifest: Path,
     descriptions_json: Path | None,
     diagnostics: dict[str, float],
     per_finding_diagnostics: dict[str, Any],
@@ -488,35 +641,45 @@ def _phase_payload(
     completed_epochs: int,
     best_valid_loss: float,
     trainable_modules: Mapping[str, bool],
+    best_checkpoint: Path | None,
 ) -> dict[str, Any]:
-    payload = {
-        "git_commit": _git_commit(),
-        "phase": phase,
-        "model_config": asdict(model.config),
-        "image_channels": list(image_channels),
-        "four_top_level_loss_weights": dict(weights),
-        "data_protocol_sha256": _sha256_file(protocol_manifest),
-        "description_file_sha256": _sha256_file(descriptions_json),
-        "uses_mscxr_annotations": False,
-        "uses_spatial_annotations": False,
-        "uses_dcem": False,
-        "afloc_trainable_parameters": afloc_trainable_parameters,
-        "diagnostics": diagnostics,
-        "per_finding_diagnostics": per_finding_diagnostics,
-        "phase_gate": dict(phase_gate),
-        "model_state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
-        "teacher_state_dict": (
-            {key: value.detach().cpu() for key, value in teacher.model.state_dict().items()}
-            if teacher is not None
-            else {}
-        ),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "checkpoint": str(checkpoint_path),
-        "previous_checkpoint": None if previous_checkpoint is None else str(previous_checkpoint),
-        "completed_epochs": int(completed_epochs),
-        "best_valid_loss": float(best_valid_loss),
-        "trainable_modules": dict(trainable_modules),
-    }
+    payload = _capture_rng_state()
+    payload.update(
+        {
+            "git_commit": _git_commit(),
+            "phase": phase,
+            "checkpoint_role": checkpoint_role,
+            "model_config": asdict(model.config),
+            "image_channels": list(image_channels),
+            "four_top_level_loss_weights": dict(weights),
+            "data_protocol_sha256": str(protocol_facts["sha256"]),
+            "protocol_manifest_path": str(protocol_manifest),
+            "description_file_sha256": _sha256_file(descriptions_json),
+            "descriptions_json_path": None if descriptions_json is None else str(descriptions_json),
+            "uses_mscxr_annotations": bool(protocol_facts["uses_mscxr_annotations"]),
+            "uses_spatial_annotations": bool(protocol_facts["uses_spatial_annotations"]),
+            "uses_dcem": bool(protocol_facts["uses_dcem"]),
+            "protocol_mscxr_overlap": int(protocol_facts["mscxr_overlap"]),
+            "protocol_train_valid_subject_overlap": int(protocol_facts["train_valid_subject_overlap"]),
+            "afloc_trainable_parameters": afloc_trainable_parameters,
+            "diagnostics": diagnostics,
+            "per_finding_diagnostics": per_finding_diagnostics,
+            "phase_gate": dict(phase_gate),
+            "model_state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
+            "teacher_state_dict": (
+                {key: value.detach().cpu() for key, value in teacher.model.state_dict().items()}
+                if teacher is not None
+                else {}
+            ),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "checkpoint": str(checkpoint_path),
+            "previous_checkpoint": None if previous_checkpoint is None else str(previous_checkpoint),
+            "completed_epochs": int(completed_epochs),
+            "best_valid_loss": float(best_valid_loss),
+            "best_checkpoint": None if best_checkpoint is None else str(best_checkpoint),
+            "trainable_modules": dict(trainable_modules),
+        }
+    )
     return payload
 
 
@@ -540,6 +703,8 @@ def _load_resume_checkpoint(phase: str, path: Path) -> dict[str, Any]:
     payload = _load_checkpoint(path)
     if payload.get("phase") != phase:
         raise ValueError(f"resume checkpoint phase mismatch: expected {phase}")
+    if payload.get("checkpoint_role") != "latest":
+        raise ValueError("resume checkpoint must point to a latest checkpoint")
     return payload
 
 
@@ -547,6 +712,115 @@ def _mean(values: list[float]) -> float:
     if not values:
         return 0.0
     return float(sum(values) / len(values))
+
+
+def _concat_tensor_dict(values: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    return {
+        key: torch.cat([item[key] for item in values], dim=0)
+        for key in values[0]
+    }
+
+
+def _concat_optional_tensor_dict(values: list[dict[str, torch.Tensor] | None]) -> dict[str, torch.Tensor] | None:
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    return _concat_tensor_dict(present)
+
+
+def _concat_mrsg_outputs(outputs: list[Any]) -> Any:
+    first = outputs[0]
+    return type(first)(
+        final_heatmap=torch.cat([output.final_heatmap for output in outputs], dim=0),
+        query_heatmaps=torch.cat([output.query_heatmaps for output in outputs], dim=0),
+        query_route_weights=torch.cat([output.query_route_weights for output in outputs], dim=0),
+        query_reliability=torch.cat([output.query_reliability for output in outputs], dim=0),
+        phrase_patch_logits=torch.cat([output.phrase_patch_logits for output in outputs], dim=0),
+        masked_predictions=_concat_optional_tensor_dict(
+            [output.masked_predictions for output in outputs]
+        ),
+        source_targets=_concat_optional_tensor_dict(
+            [output.source_targets for output in outputs]
+        ),
+        patch_mask=(
+            torch.cat([output.patch_mask for output in outputs], dim=0)
+            if first.patch_mask is not None
+            else None
+        ),
+        query_reconstructed_phrase=(
+            torch.cat([output.query_reconstructed_phrase for output in outputs], dim=0)
+            if first.query_reconstructed_phrase is not None
+            else None
+        ),
+        query_patch_gates=(
+            torch.cat([output.query_patch_gates for output in outputs], dim=0)
+            if first.query_patch_gates is not None
+            else None
+        ),
+    )
+
+
+def _concat_teacher_targets(targets: list[TeacherTarget | None]) -> TeacherTarget | None:
+    present = [target for target in targets if target is not None]
+    if not present:
+        return None
+    return TeacherTarget(
+        final_heatmap=torch.cat([target.final_heatmap for target in present], dim=0),
+        query_heatmaps=torch.cat([target.query_heatmaps for target in present], dim=0),
+        confidence=torch.cat([target.confidence for target in present], dim=0),
+        route_weights=torch.cat([target.route_weights for target in present], dim=0),
+    )
+
+
+def _concat_negative_batches(
+    scores: list[torch.Tensor],
+    masks: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    max_negatives = max((tensor.shape[1] for tensor in scores), default=0)
+    padded_scores = []
+    padded_masks = []
+    for score, mask in zip(scores, masks):
+        if score.shape[1] < max_negatives:
+            pad = torch.zeros(
+                score.shape[0],
+                max_negatives - score.shape[1],
+                device=score.device,
+                dtype=score.dtype,
+            )
+            mask_pad = torch.zeros(
+                mask.shape[0],
+                max_negatives - mask.shape[1],
+                device=mask.device,
+                dtype=torch.bool,
+            )
+            score = torch.cat([score, pad], dim=1)
+            mask = torch.cat([mask, mask_pad], dim=1)
+        padded_scores.append(score)
+        padded_masks.append(mask)
+    if not padded_scores:
+        return torch.zeros(0, 0), torch.zeros(0, 0, dtype=torch.bool)
+    return torch.cat(padded_scores, dim=0), torch.cat(padded_masks, dim=0)
+
+
+def _masked_positive_negative_margin(
+    positive_scores: torch.Tensor,
+    negative_scores: torch.Tensor,
+    negative_mask: torch.Tensor,
+) -> float:
+    if positive_scores.ndim != 1 or negative_scores.ndim != 2 or negative_mask.shape != negative_scores.shape:
+        return 0.0
+    if positive_scores.shape[0] == 0 or negative_scores.shape[0] != positive_scores.shape[0]:
+        return 0.0
+    if negative_scores.shape[1] == 0:
+        return 0.0
+    valid = negative_mask.sum()
+    if int(valid.detach().cpu().item()) == 0:
+        return 0.0
+    negative_mean = (
+        negative_scores.detach() * negative_mask.to(dtype=negative_scores.dtype)
+    ).sum() / valid.to(dtype=negative_scores.dtype)
+    margin = positive_scores.detach().mean() - negative_mean
+    return float(margin.cpu().item())
 
 
 def _run_epoch(
@@ -579,29 +853,25 @@ def _run_epoch(
     last_output = None
     last_positive = None
     last_negative = None
+    last_negative_mask = None
     last_teacher_target = None
     num_skipped_examples = 0
     num_optimization_steps = 0
     per_finding: dict[str, dict[str, float]] = {}
+    output_batches = []
+    positive_batches = []
+    negative_batches = []
+    negative_mask_batches = []
+    teacher_target_batches = []
 
     for step, raw_batch in enumerate(loader):
         batch = raw_batch
-        if phase != "locality":
-            valid_indices = [
-                index
-                for index, negatives in enumerate(batch["negative_phrases"])
-                if len(negatives) > 0
-            ]
-            num_skipped_examples += _geometry_batch_size(batch) - len(valid_indices)
-            if not valid_indices:
-                continue
-            batch = _select_batch(batch, valid_indices)
         if _geometry_batch_size(batch) == 0:
             continue
 
         if is_training:
             optimizer.zero_grad(set_to_none=True)
-        loss, output, positive_scores, negative_scores, teacher_target = _batch_forward_and_loss(
+        loss, output, positive_scores, negative_scores, negative_mask, teacher_target = _batch_forward_and_loss(
             phase=phase,
             model=model,
             afloc_encoder=afloc_encoder,
@@ -627,7 +897,13 @@ def _run_epoch(
         last_output = output
         last_positive = positive_scores.detach()
         last_negative = negative_scores.detach()
+        last_negative_mask = negative_mask.detach()
         last_teacher_target = teacher_target
+        output_batches.append(output)
+        positive_batches.append(positive_scores.detach())
+        negative_batches.append(negative_scores.detach())
+        negative_mask_batches.append(negative_mask.detach())
+        teacher_target_batches.append(teacher_target)
         for finding in batch["finding"]:
             entry = per_finding.setdefault(str(finding), {"count": 0.0})
             entry["count"] += 1.0
@@ -639,11 +915,23 @@ def _run_epoch(
         finding: {"count": int(values["count"])}
         for finding, values in sorted(per_finding.items())
     }
+    aggregate_output = _concat_mrsg_outputs(output_batches)
+    aggregate_positive = torch.cat(positive_batches, dim=0)
+    aggregate_negative, aggregate_negative_mask = _concat_negative_batches(
+        negative_batches,
+        negative_mask_batches,
+    )
     return {
         "losses": {name: _mean(values) for name, values in totals.items()},
+        "aggregate_output": aggregate_output,
+        "aggregate_positive_scores": aggregate_positive,
+        "aggregate_negative_scores": aggregate_negative,
+        "aggregate_negative_mask": aggregate_negative_mask,
+        "aggregate_teacher_target": _concat_teacher_targets(teacher_target_batches),
         "last_output": last_output,
         "last_positive_scores": last_positive,
         "last_negative_scores": last_negative,
+        "last_negative_mask": last_negative_mask,
         "last_teacher_target": last_teacher_target,
         "num_skipped_examples": int(num_skipped_examples),
         "num_optimization_steps": int(num_optimization_steps),
@@ -718,6 +1006,7 @@ def train_afloc_mrsg(
     previous_path = None if previous_checkpoint is None else Path(previous_checkpoint)
     resume_path = None if resume_checkpoint is None else Path(resume_checkpoint)
     torch_device = torch.device(device)
+    protocol_facts = _validate_protocol_manifest(protocol_path)
 
     train_dataset = MRSGDataset(manifest_path=train_manifest, image_root=image_root)
     valid_dataset = MRSGDataset(manifest_path=valid_manifest, image_root=image_root)
@@ -766,10 +1055,14 @@ def train_afloc_mrsg(
         if teacher is not None and resume_payload.get("teacher_state_dict"):
             teacher.model.load_state_dict(resume_payload["teacher_state_dict"], strict=True)
         optimizer.load_state_dict(resume_payload["optimizer_state_dict"])
+        _restore_rng_state(resume_payload)
         start_epoch = int(resume_payload.get("completed_epochs", 0))
-        if bool((resume_payload.get("phase_gate") or {}).get("passed")):
+        best_valid_loss = float(resume_payload.get("best_valid_loss", float("inf")))
+        best_checkpoint = resume_payload.get("best_checkpoint")
+        if isinstance(best_checkpoint, str) and Path(best_checkpoint).exists():
+            best_payload = _load_checkpoint(Path(best_checkpoint))
+        elif bool((resume_payload.get("phase_gate") or {}).get("passed")):
             best_payload = dict(resume_payload)
-            best_valid_loss = float(resume_payload.get("best_valid_loss", float("inf")))
 
     afloc_encoder = afloc_encoder.to(torch_device)
     afloc_encoder.train(False)
@@ -790,6 +1083,9 @@ def train_afloc_mrsg(
         )
 
     last_report: dict[str, Any] | None = None
+    payload: dict[str, Any] | None = None
+    latest_checkpoint_path = outdir / LATEST_CHECKPOINT_NAMES[normalized_phase]
+    best_checkpoint_path = outdir / PHASE_CHECKPOINT_NAMES[normalized_phase]
     for epoch in range(start_epoch, int(epochs)):
         _set_seed(seed + epoch)
         train_epoch = _run_epoch(
@@ -820,53 +1116,31 @@ def train_afloc_mrsg(
             teacher=teacher,
         )
         diagnostics = collect_mrsg_diagnostics(
-            output=valid_epoch["last_output"],
-            positive_scores=valid_epoch["last_positive_scores"],
-            negative_scores=valid_epoch["last_negative_scores"],
-            teacher_target=valid_epoch["last_teacher_target"],
+            output=valid_epoch["aggregate_output"],
+            positive_scores=valid_epoch["aggregate_positive_scores"],
+            negative_scores=valid_epoch["aggregate_negative_scores"],
+            teacher_target=valid_epoch["aggregate_teacher_target"],
             masked_reconstruction_loss=valid_epoch["losses"]["mask"],
             untrained_masked_reconstruction_loss=untrained_mask_loss,
             model=model,
             phase_b_positive_negative_margin=phase_b_margin,
         )
-        if normalized_phase == "locality":
-            diagnostics["heatmap_std"] = max(diagnostics["heatmap_std"], 0.05)
-            diagnostics["max_route_utilization"] = min(
-                diagnostics["max_route_utilization"],
-                0.50,
-            )
-            diagnostics["query_pairwise_cosine"] = min(
-                diagnostics["query_pairwise_cosine"],
-                0.50,
-            )
-            diagnostics["positive_negative_margin"] = max(
-                diagnostics["positive_negative_margin"],
-                0.10,
-            )
-        if normalized_phase == "consistency":
-            diagnostics["teacher_confident_coverage"] = min(
-                max(diagnostics["teacher_confident_coverage"], 0.25),
-                0.75,
-            )
-            if phase_b_margin is not None:
-                diagnostics["positive_negative_margin"] = max(
-                    diagnostics["positive_negative_margin"],
-                    float(phase_b_margin) + 0.01,
-                )
-                diagnostics["phase_b_positive_negative_margin"] = float(phase_b_margin)
-                diagnostics["phase_b_positive_negative_margin_finite"] = 1.0
-                diagnostics["consistency_margin_delta_vs_phase_b"] = (
-                    diagnostics["positive_negative_margin"] - float(phase_b_margin)
-                )
+        diagnostics["positive_negative_margin"] = _masked_positive_negative_margin(
+            valid_epoch["aggregate_positive_scores"],
+            valid_epoch["aggregate_negative_scores"],
+            valid_epoch["aggregate_negative_mask"],
+        )
         phase_gate = evaluate_phase_gate(normalized_phase, diagnostics)
-        checkpoint_path = outdir / PHASE_CHECKPOINT_NAMES[normalized_phase]
+        current_best_valid_loss = min(best_valid_loss, float(valid_epoch["losses"]["total"]))
         payload = _phase_payload(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=latest_checkpoint_path,
+            checkpoint_role="latest",
             model=model,
             teacher=teacher,
             optimizer=optimizer,
             phase=normalized_phase,
             weights=weights,
+            protocol_facts=protocol_facts,
             protocol_manifest=protocol_path,
             descriptions_json=descriptions_path,
             diagnostics=diagnostics,
@@ -881,15 +1155,18 @@ def train_afloc_mrsg(
             afloc_trainable_parameters=afloc_trainable_parameters,
             previous_checkpoint=previous_path,
             completed_epochs=epoch + 1,
-            best_valid_loss=min(best_valid_loss, float(valid_epoch["losses"]["total"])),
+            best_valid_loss=current_best_valid_loss,
             trainable_modules=trainable_modules,
+            best_checkpoint=(best_checkpoint_path if best_payload is not None else None),
         )
+        torch.save(payload, latest_checkpoint_path)
         last_report = {
             "phase": normalized_phase,
-            "checkpoint": str(checkpoint_path),
+            "checkpoint": str(best_checkpoint_path),
+            "latest_checkpoint": str(latest_checkpoint_path),
             "report": str(outdir / "train_report.json"),
             "completed_epochs": epoch + 1,
-            "best_valid_loss": float(valid_epoch["losses"]["total"]),
+            "best_valid_loss": float(current_best_valid_loss),
             "diagnostics": diagnostics,
             "per_finding_diagnostics": valid_epoch["per_finding_diagnostics"],
             "phase_gate": payload["phase_gate"],
@@ -897,9 +1174,9 @@ def train_afloc_mrsg(
             "four_top_level_loss_weights": dict(weights),
             "data_protocol_sha256": payload["data_protocol_sha256"],
             "description_file_sha256": payload["description_file_sha256"],
-            "uses_mscxr_annotations": False,
-            "uses_spatial_annotations": False,
-            "uses_dcem": False,
+            "uses_mscxr_annotations": payload["uses_mscxr_annotations"],
+            "uses_spatial_annotations": payload["uses_spatial_annotations"],
+            "uses_dcem": payload["uses_dcem"],
             "num_train_rows": len(train_dataset),
             "num_valid_rows": len(valid_dataset),
             "num_skipped_examples": train_epoch["num_skipped_examples"] + valid_epoch["num_skipped_examples"],
@@ -910,24 +1187,33 @@ def train_afloc_mrsg(
         }
         if phase_gate.passed and float(valid_epoch["losses"]["total"]) <= best_valid_loss:
             best_valid_loss = float(valid_epoch["losses"]["total"])
-            payload["best_valid_loss"] = best_valid_loss
-            best_payload = payload
+            best_payload = dict(payload)
+            best_payload["checkpoint"] = str(best_checkpoint_path)
+            best_payload["checkpoint_role"] = "best"
+            best_payload["best_valid_loss"] = best_valid_loss
+            best_payload["best_checkpoint"] = str(best_checkpoint_path)
+            torch.save(best_payload, best_checkpoint_path)
+            payload["best_checkpoint"] = str(best_checkpoint_path)
+            torch.save(payload, latest_checkpoint_path)
 
     if last_report is None:
         raise RuntimeError("training loop did not run")
 
-    final_payload = best_payload if best_payload is not None else payload
-    final_payload["best_valid_loss"] = best_valid_loss if best_payload is not None else float(
-        last_report["best_valid_loss"]
-    )
-    checkpoint_path = Path(final_payload["checkpoint"])
-    torch.save(final_payload, checkpoint_path)
+    if best_payload is None:
+        assert payload is not None
+        best_payload = dict(payload)
+        best_payload["checkpoint"] = str(best_checkpoint_path)
+        best_payload["checkpoint_role"] = "best"
+        best_payload["best_valid_loss"] = float(last_report["best_valid_loss"])
+        best_payload["best_checkpoint"] = str(best_checkpoint_path)
+        torch.save(best_payload, best_checkpoint_path)
 
-    last_report["checkpoint"] = str(checkpoint_path)
-    last_report["best_valid_loss"] = float(final_payload["best_valid_loss"])
-    last_report["phase_gate"] = final_payload["phase_gate"]
-    last_report["diagnostics"] = final_payload["diagnostics"]
-    last_report["per_finding_diagnostics"] = final_payload["per_finding_diagnostics"]
+    last_report["checkpoint"] = str(best_checkpoint_path)
+    last_report["latest_checkpoint"] = str(latest_checkpoint_path)
+    last_report["best_valid_loss"] = float(best_payload["best_valid_loss"])
+    last_report["phase_gate"] = best_payload["phase_gate"]
+    last_report["diagnostics"] = best_payload["diagnostics"]
+    last_report["per_finding_diagnostics"] = best_payload["per_finding_diagnostics"]
     report_path = Path(last_report["report"])
     report_path.write_text(json.dumps(last_report, indent=2), encoding="utf-8")
     return last_report

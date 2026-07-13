@@ -127,6 +127,45 @@ def test_dataset_uses_shared_geometry_for_weak_and_strong_but_distinct_photometr
     assert torch.equal(sample["strong_geometry_image"], sample["geometry_applied_image"])
 
 
+def test_dataset_exposes_relative_equivariance_transform_for_flip_xor(tmp_path: Path) -> None:
+    from anaprior.data.mrsg_dataset import MRSGDataset, geometry_transform_from_metadata
+
+    flipped_weak = MRSGDataset(
+        manifest_path=_write_manifest_and_image(tmp_path, image_name="flip-a.png"),
+        image_size=(6, 6),
+        crop_size=(4, 4),
+        seed=7,
+        geometry_prob=1.0,
+        horizontal_flip_prob=1.0,
+        weak_noise_std=0.0,
+        strong_noise_std=0.0,
+        equivariance_horizontal_flip_prob=0.0,
+    )[0]
+    flipped_equiv = MRSGDataset(
+        manifest_path=_write_manifest_and_image(tmp_path, image_name="flip-b.png"),
+        image_size=(6, 6),
+        crop_size=(4, 4),
+        seed=7,
+        geometry_prob=1.0,
+        horizontal_flip_prob=0.0,
+        weak_noise_std=0.0,
+        strong_noise_std=0.0,
+        equivariance_horizontal_flip_prob=1.0,
+    )[0]
+
+    relative_a = geometry_transform_from_metadata(flipped_weak["relative_equivariance_transform"])
+    relative_b = geometry_transform_from_metadata(flipped_equiv["relative_equivariance_transform"])
+
+    assert relative_a == GeometryTransform(
+        horizontal_flip=True,
+        crop_top=0,
+        crop_left=0,
+        crop_height=4,
+        crop_width=4,
+    )
+    assert relative_b == relative_a
+
+
 def test_dataset_is_deterministic_for_the_same_seed_and_varies_across_seeds(tmp_path: Path) -> None:
     from anaprior.data.mrsg_dataset import MRSGDataset, geometry_transform_from_metadata
 
@@ -290,8 +329,12 @@ def test_default_dataloader_collates_geometry_metadata_and_reconstructs_transfor
         "crop_height",
         "crop_width",
     }
+    assert set(batch["relative_equivariance_transform"]) == set(batch["geometry"])
     assert all(torch.is_tensor(value) for value in batch["geometry"].values())
     assert all(torch.is_tensor(value) for value in batch["equivariance_transform"].values())
+    assert all(
+        torch.is_tensor(value) for value in batch["relative_equivariance_transform"].values()
+    )
 
     first_geometry = geometry_transform_from_metadata(
         {key: value[0] for key, value in batch["geometry"].items()}
@@ -300,6 +343,16 @@ def test_default_dataloader_collates_geometry_metadata_and_reconstructs_transfor
         horizontal_flip=True,
         crop_top=0,
         crop_left=2,
+        crop_height=4,
+        crop_width=4,
+    )
+    first_relative = geometry_transform_from_metadata(
+        {key: value[0] for key, value in batch["relative_equivariance_transform"].items()}
+    )
+    assert first_relative == GeometryTransform(
+        horizontal_flip=False,
+        crop_top=0,
+        crop_left=0,
         crop_height=4,
         crop_width=4,
     )

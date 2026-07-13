@@ -114,6 +114,25 @@ def geometry_transform_from_metadata(metadata: Mapping[str, object]) -> Geometry
     )
 
 
+def relative_geometry_transform(
+    source: GeometryTransform,
+    target: GeometryTransform,
+) -> GeometryTransform:
+    source_height = (
+        int(source.crop_height) if source.crop_height is not None else int(target.crop_height or 0)
+    )
+    source_width = (
+        int(source.crop_width) if source.crop_width is not None else int(target.crop_width or 0)
+    )
+    return GeometryTransform(
+        horizontal_flip=bool(source.horizontal_flip) ^ bool(target.horizontal_flip),
+        crop_top=0,
+        crop_left=0,
+        crop_height=source_height,
+        crop_width=source_width,
+    )
+
+
 class MRSGDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
@@ -234,6 +253,7 @@ class MRSGDataset(Dataset[dict[str, Any]]):
         image = self._load_image(str(row["image_path"]))
         geometry = self._geometry_transform(index)
         equivariance_transform = self._equivariance_transform(index, geometry)
+        relative_transform = relative_geometry_transform(geometry, equivariance_transform)
         geometry_applied = self._apply_geometry(image, geometry)
         equivariance_image = self._apply_geometry(image, equivariance_transform)
         weak_image = _noise_like(
@@ -273,6 +293,7 @@ class MRSGDataset(Dataset[dict[str, Any]]):
             "equivariance_image": equivariance_image,
             "geometry": geometry_metadata(geometry),
             "equivariance_transform": geometry_metadata(equivariance_transform),
+            "relative_equivariance_transform": geometry_metadata(relative_transform),
             "subject_id": str(row["subject_id"]),
             "study_id": str(row["study_id"]),
             "dicom_id": str(row["dicom_id"]),
@@ -289,4 +310,5 @@ __all__ = [
     "MRSGDataset",
     "geometry_metadata",
     "geometry_transform_from_metadata",
+    "relative_geometry_transform",
 ]

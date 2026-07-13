@@ -26,8 +26,11 @@ def cross_modal_grounding_loss(
     reconstructed_phrase: torch.Tensor,
     target_phrase: torch.Tensor,
     margin: float = 0.2,
+    negative_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    _validate_positive_negative_scores(positive_scores, negative_scores)
+    if negative_mask is None:
+        negative_mask = torch.ones_like(negative_scores, dtype=torch.bool)
+    _validate_positive_negative_scores(positive_scores, negative_scores, negative_mask)
     _require_finite("reconstructed_phrase", reconstructed_phrase)
     _require_finite("target_phrase", target_phrase)
     if reconstructed_phrase.ndim == 2:
@@ -38,8 +41,6 @@ def cross_modal_grounding_loss(
         raise ValueError("target_phrase must have shape [B,C]")
     if reconstructed_phrase.shape[0] != positive_scores.shape[0]:
         raise ValueError("reconstructed_phrase must share positive_scores batch size")
-    if reconstructed_phrase.shape[2] != target_phrase.shape[1]:
-        raise ValueError("target_phrase must match reconstructed phrase dimension")
     if target_phrase.shape[0] != positive_scores.shape[0]:
         raise ValueError("target_phrase must share positive_scores batch size")
     if margin < 0.0:
@@ -47,14 +48,21 @@ def cross_modal_grounding_loss(
 
     positive_prob = positive_scores.clamp(1.0e-6, 1.0 - 1.0e-6)
     mil = F.binary_cross_entropy(positive_prob, torch.ones_like(positive_prob))
+    aligned_target_phrase = _align_target_phrase_dimension(
+        target_phrase.detach(),
+        reconstructed_phrase.shape[2],
+    )
     cycle = _cosine_distance(
         reconstructed_phrase,
-        target_phrase.detach().unsqueeze(1).expand_as(reconstructed_phrase),
+        aligned_target_phrase.unsqueeze(1).expand_as(reconstructed_phrase),
         dim=-1,
     ).mean()
-    counterfactual = F.relu(
-        margin + negative_scores - positive_scores.unsqueeze(1),
-    ).mean()
+    counterfactual = _masked_counterfactual_mean(
+        positive_scores=positive_scores,
+        negative_scores=negative_scores,
+        negative_mask=negative_mask,
+        margin=margin,
+    )
     return mil + 0.5 * cycle + counterfactual
 
 
@@ -144,24 +152,31 @@ def compute_mrsg_loss(
     config: Any,
     target_phrase: torch.Tensor | None = None,
     margin: float = 0.2,
+    negative_mask: torch.Tensor | None = None,
 ) -> MRSGGroupedLoss:
     if not isinstance(student, MRSGOutput):
         raise ValueError("student must be an MRSGOutput")
     student.validate()
-    if target_phrase is None:
+    ground_weight = _top_level_weight(config, "w_ground")
+    if ground_weight > 0.0:
+        if target_phrase is None:
+            raise ValueError("target_phrase is required when grounding weight is active")
         if student.query_reconstructed_phrase is None:
-            raise ValueError("target_phrase is required when query reconstruction is absent")
-        target_phrase = student.query_reconstructed_phrase.mean(dim=1).detach()
-    if student.query_reconstructed_phrase is None:
-        raise ValueError("student.query_reconstructed_phrase is required")
-
-    grounding = cross_modal_grounding_loss(
-        positive_scores,
-        negative_scores,
-        student.query_reconstructed_phrase,
-        target_phrase,
-        margin=margin,
-    )
+            raise ValueError("student.query_reconstructed_phrase is required")
+        grounding = cross_modal_grounding_loss(
+            positive_scores,
+            negative_scores,
+            student.query_reconstructed_phrase,
+            target_phrase.detach(),
+            margin=margin,
+            negative_mask=negative_mask,
+        )
+    else:
+        grounding = _zero_like_loss(
+            positive_scores,
+            negative_scores,
+            student.final_heatmap,
+        )
     teacher = teacher_equivariance_loss(
         student.final_heatmap,
         student.query_heatmaps,
@@ -171,7 +186,7 @@ def compute_mrsg_loss(
     query = query_regularization_loss(student.query_heatmaps, student.query_route_weights)
 
     total = (
-        _top_level_weight(config, "w_ground") * grounding
+        ground_weight * grounding
         + _top_level_weight(config, "w_teacher") * teacher
         + _top_level_weight(config, "w_mask") * mask
         + _top_level_weight(config, "w_query") * query
@@ -188,8 +203,10 @@ def compute_mrsg_loss(
             "teacher": _float_detached(teacher),
             "mask": _float_detached(mask),
             "query": _float_detached(query),
-            "positive_negative_margin": _float_detached(
-                positive_scores.detach().mean() - negative_scores.detach().mean()
+            "positive_negative_margin": _masked_positive_negative_margin(
+                positive_scores,
+                negative_scores,
+                negative_mask,
             ),
             "teacher_confident_coverage": _teacher_coverage(teacher_target),
             "query_pairwise_cosine": _float_detached(
@@ -217,6 +234,7 @@ def _mask_group_loss(student: MRSGOutput, pyramid: Any) -> torch.Tensor:
 def _validate_positive_negative_scores(
     positive_scores: torch.Tensor,
     negative_scores: torch.Tensor,
+    negative_mask: torch.Tensor,
 ) -> None:
     if positive_scores.ndim != 1:
         raise ValueError("positive_scores must have shape [B]")
@@ -224,10 +242,67 @@ def _validate_positive_negative_scores(
         raise ValueError("negative_scores must have shape [B,N]")
     if negative_scores.shape[0] != positive_scores.shape[0]:
         raise ValueError("negative_scores must share positive_scores batch size")
-    if negative_scores.shape[1] == 0:
-        raise ValueError("negative_scores must contain at least one negative")
+    if negative_mask.shape != negative_scores.shape:
+        raise ValueError("negative_mask must match negative_scores shape")
+    if negative_mask.dtype != torch.bool:
+        raise ValueError("negative_mask must be boolean")
     _require_finite("positive_scores", positive_scores)
     _require_finite("negative_scores", negative_scores)
+
+
+def _masked_counterfactual_mean(
+    *,
+    positive_scores: torch.Tensor,
+    negative_scores: torch.Tensor,
+    negative_mask: torch.Tensor,
+    margin: float,
+) -> torch.Tensor:
+    if negative_scores.shape[1] == 0:
+        return _zero_like_loss(positive_scores, negative_scores)
+    penalties = F.relu(margin + negative_scores - positive_scores.unsqueeze(1))
+    masked = penalties * negative_mask.to(dtype=penalties.dtype)
+    valid_count = negative_mask.sum()
+    if int(valid_count.detach().cpu().item()) == 0:
+        return _zero_like_loss(positive_scores, negative_scores)
+    return masked.sum() / valid_count.to(dtype=penalties.dtype)
+
+
+def _align_target_phrase_dimension(
+    target_phrase: torch.Tensor,
+    reconstructed_dim: int,
+) -> torch.Tensor:
+    if target_phrase.shape[1] == reconstructed_dim:
+        return target_phrase
+    resized = F.interpolate(
+        target_phrase.unsqueeze(1),
+        size=reconstructed_dim,
+        mode="linear",
+        align_corners=False,
+    )
+    return resized.squeeze(1)
+
+
+def _masked_positive_negative_margin(
+    positive_scores: torch.Tensor,
+    negative_scores: torch.Tensor,
+    negative_mask: torch.Tensor | None,
+) -> float:
+    if negative_mask is None:
+        negative_mask = torch.ones_like(negative_scores, dtype=torch.bool)
+    if positive_scores.ndim != 1 or negative_scores.ndim != 2 or negative_mask.shape != negative_scores.shape:
+        return 0.0
+    if positive_scores.shape[0] == 0 or negative_scores.shape[0] != positive_scores.shape[0]:
+        return 0.0
+    if negative_scores.shape[1] == 0:
+        return 0.0
+    valid_count = negative_mask.sum()
+    if int(valid_count.detach().cpu().item()) == 0:
+        return 0.0
+    negative_mean = (
+        negative_scores.detach() * negative_mask.to(dtype=negative_scores.dtype)
+    ).sum() / valid_count.to(dtype=negative_scores.dtype)
+    margin = positive_scores.detach().mean() - negative_mean
+    return float(margin.cpu().item())
 
 
 def _validate_student_maps(
