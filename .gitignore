@@ -22,7 +22,7 @@ weights/
 *.safetensors
 
 # Datasets
-data/
+/data/
 datasets/
 MIMIC-CXR/
 MS-CXR/
