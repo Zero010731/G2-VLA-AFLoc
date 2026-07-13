@@ -11,6 +11,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from anaprior.eval.eval_mscxr_afloc_mrsg import build_hmap_lookup_key, stable_case_id
+
 
 METRICS = ("cnr", "iou", "dice")
 DEFAULT_METHODS = (
@@ -20,6 +22,7 @@ DEFAULT_METHODS = (
     "disease_pooled_learned",
     "phrase_anatomy_dcem",
     "dp_msa",
+    "afloc_mrsg",
     "all_class_learned",
     "candidate_shuffled",
     "candidate_uniform",
@@ -91,15 +94,24 @@ def comparison_specs_for_methods(
             append_dynamic(name, method_a, method_b)
 
     for method in sorted(method_set):
-        if not method.startswith("dp_msa"):
+        if not method.startswith(("dp_msa", "dense_dp_msa", "afloc_mrsg")):
             continue
-        for baseline_method in ["baseline", "phrase_anatomy_dcem", "candidate_shuffled"]:
+        if method.startswith("afloc_mrsg"):
+            baseline_methods = ["baseline", "phrase_anatomy_dcem"]
+        else:
+            baseline_methods = ["baseline", "phrase_anatomy_dcem", "candidate_shuffled"]
+        for baseline_method in baseline_methods:
             append_dynamic(f"{method}_vs_{baseline_method}", method, baseline_method)
     return specs
 
 
 def stable_int(value: str) -> int:
     return int(hashlib.md5(str(value).encode("utf-8")).hexdigest()[:8], 16)
+
+
+def _concat_result_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    cleaned = [frame.dropna(axis=1, how="all") for frame in frames if not frame.empty]
+    return pd.concat(cleaned, axis=0, ignore_index=True) if cleaned else pd.DataFrame()
 
 
 def assign_split(case_id: str, val_fraction: float = 0.3, seed: int = 0) -> str:
@@ -154,7 +166,28 @@ def filter_eval_dataframe_by_categories(
     return data[data["category"].astype(str).isin(category_set)].copy()
 
 
-def resolve_hmap_key(path: Any, label_text: Any, hmap_keys: set[str]) -> str | None:
+def build_hmap_metadata_index(hmaps: dict[str, Any]) -> dict[str, list[str]]:
+    metadata_index: dict[str, list[str]] = {}
+    for key, payload in hmaps.items():
+        if not isinstance(payload, dict):
+            continue
+        path = payload.get("path")
+        label_text = payload.get("label_text")
+        if path is None or label_text is None:
+            continue
+        lookup = build_hmap_lookup_key(path, label_text)
+        metadata_index.setdefault(lookup, []).append(str(key))
+    return metadata_index
+
+
+def resolve_hmap_key(
+    path: Any,
+    label_text: Any,
+    hmap_keys: set[str],
+    *,
+    case_id: Any = None,
+    metadata_index: dict[str, list[str]] | None = None,
+) -> str | None:
     """Resolve dataset row identity to an hmap key.
 
     Stage C hmap keys historically use `path + label_text`, but some generated
@@ -162,9 +195,17 @@ def resolve_hmap_key(path: Any, label_text: Any, hmap_keys: set[str]) -> str | N
     key with the same image path prefix is accepted as a conservative alias.
     """
 
+    if case_id is not None and str(case_id) in hmap_keys:
+        return str(case_id)
     exact = str(path) + str(label_text)
     if exact in hmap_keys:
         return exact
+    if metadata_index is not None:
+        metadata_matches = metadata_index.get(exact, [])
+        if case_id is not None and str(case_id) in metadata_matches:
+            return str(case_id)
+        if len(metadata_matches) == 1:
+            return metadata_matches[0]
     prefix = str(path)
     candidates = [key for key in hmap_keys if key.startswith(prefix)]
     if len(candidates) == 1:
@@ -172,7 +213,11 @@ def resolve_hmap_key(path: Any, label_text: Any, hmap_keys: set[str]) -> str | N
     return None
 
 
-def filter_eval_dataframe_by_hmap_keys(data: pd.DataFrame, hmap_keys: set[str]) -> pd.DataFrame:
+def filter_eval_dataframe_by_hmap_keys(
+    data: pd.DataFrame,
+    hmap_keys: set[str],
+    metadata_index: dict[str, list[str]] | None = None,
+) -> pd.DataFrame:
     """Keep only evaluation rows with heatmaps available for every scored method."""
 
     required = {"path", "label_text"}
@@ -181,11 +226,50 @@ def filter_eval_dataframe_by_hmap_keys(data: pd.DataFrame, hmap_keys: set[str]) 
         raise ValueError(f"evaluation data is missing required columns: {sorted(missing)}")
     key_set = {str(key) for key in hmap_keys}
     keep = [
-        resolve_hmap_key(path, label_text, key_set) is not None
-        for path, label_text in zip(data["path"], data["label_text"])
+        resolve_hmap_key(
+            path,
+            label_text,
+            key_set,
+            case_id=case_id,
+            metadata_index=metadata_index,
+        )
+        is not None
+        for path, label_text, case_id in zip(
+            data["path"],
+            data["label_text"],
+            data["case_id"] if "case_id" in data.columns else [None] * len(data),
+        )
     ]
     out = data[keep].copy()
     out.index = range(len(out))
+    return out
+
+
+def attach_stable_case_ids(data: pd.DataFrame, dataset: str) -> pd.DataFrame:
+    out = data.copy()
+    duplicate_counts: dict[str, int] = {}
+    case_ids: list[str] = []
+    hmap_keys: list[str] = []
+    for path, label_text, category in zip(
+        out["path"],
+        out["label_text"],
+        out["category"],
+    ):
+        hmap_key = build_hmap_lookup_key(path, label_text)
+        duplicate_index = int(duplicate_counts.get(hmap_key, 0))
+        duplicate_counts[hmap_key] = duplicate_index + 1
+        hmap_keys.append(hmap_key)
+        case_ids.append(
+            stable_case_id(
+                dataset=dataset,
+                path=path,
+                label_text=label_text,
+                category=category,
+                duplicate_index=duplicate_index,
+            )
+        )
+    out["hmap_key"] = hmap_keys
+    out["case_id"] = case_ids
     return out
 
 
@@ -523,6 +607,23 @@ def _candidate_role(category: str) -> str:
     return "candidate_evidence"
 
 
+def _standalone_primary_method(summary: pd.DataFrame) -> str | None:
+    if summary.empty or "comparison" not in summary.columns:
+        return None
+    methods = sorted(
+        {
+            str(value).rsplit("_vs_baseline", 1)[0]
+            for value in summary["comparison"].dropna().astype(str)
+            if str(value).startswith("afloc_mrsg") and str(value).endswith("_vs_baseline")
+        }
+    )
+    if not methods:
+        return None
+    if "afloc_mrsg" in methods:
+        return "afloc_mrsg"
+    return methods[0]
+
+
 def make_per_class_learned_repair_decisions(
     per_class_summary: pd.DataFrame,
     candidate_categories: set[str] | list[str] | tuple[str, ...],
@@ -592,6 +693,58 @@ def make_learned_repair_decision(
     candidate = _summary_row(summary, "learned_selective_vs_baseline", "macro_candidate")
     macro_all = _summary_row(summary, "learned_selective_vs_baseline", "macro_all")
     specificity = _summary_row(summary, "learned_selective_vs_candidate_shuffled", "macro_candidate")
+    standalone_method = _standalone_primary_method(summary)
+    if standalone_method is not None and candidate is None:
+        primary_comparison = f"{standalone_method}_vs_baseline"
+        secondary_comparison = (
+            f"{standalone_method}_vs_phrase_anatomy_dcem"
+            if _summary_row(summary, f"{standalone_method}_vs_phrase_anatomy_dcem", "macro_candidate") is not None
+            else None
+        )
+        candidate = _summary_row(summary, primary_comparison, "macro_candidate")
+        macro_all = _summary_row(summary, primary_comparison, "macro_all")
+        replacement = (
+            _summary_row(summary, secondary_comparison, "macro_candidate")
+            if secondary_comparison is not None
+            else None
+        )
+        if candidate is None or macro_all is None:
+            return {
+                "verdict": "insufficient_evidence",
+                "reason": "missing_test_cnr_summary",
+                "candidate_effect_floor": candidate_effect_floor,
+                "macro_all_harm_floor": macro_all_harm_floor,
+                "primary_comparison": primary_comparison,
+                "secondary_comparison": secondary_comparison,
+            }
+        candidate_pass = float(candidate["mean_delta"]) >= float(candidate_effect_floor) and float(candidate["ci_low"]) > 0
+        macro_safe = float(macro_all["ci_low"]) >= float(macro_all_harm_floor)
+        if not candidate_pass:
+            verdict = f"reject_{standalone_method}"
+            reason = "candidate_effect_floor_or_ci_not_met"
+        elif not macro_safe:
+            verdict = "candidate_only_but_macro_harm"
+            reason = "candidate_improves_but_macro_all_harm"
+        else:
+            verdict = f"keep_{standalone_method}"
+            reason = "candidate_gain_and_macro_safety_met"
+        decision = {
+            "verdict": verdict,
+            "reason": reason,
+            "candidate_effect_floor": candidate_effect_floor,
+            "macro_all_harm_floor": macro_all_harm_floor,
+            "primary_comparison": primary_comparison,
+            "secondary_comparison": secondary_comparison,
+            "candidate_vs_baseline_cnr_delta": round(float(candidate["mean_delta"]), 6),
+            "candidate_vs_baseline_cnr_ci_low": round(float(candidate["ci_low"]), 6),
+            "macro_all_cnr_delta": round(float(macro_all["mean_delta"]), 6),
+            "macro_all_cnr_ci_low": round(float(macro_all["ci_low"]), 6),
+        }
+        if replacement is not None:
+            decision["replacement_vs_phrase_anatomy_dcem_cnr_delta"] = round(float(replacement["mean_delta"]), 6)
+            decision["replacement_vs_phrase_anatomy_dcem_cnr_ci_low"] = round(float(replacement["ci_low"]), 6)
+        return decision
+
     if candidate is None or macro_all is None or specificity is None:
         decision = {
             "verdict": "insufficient_evidence",
@@ -673,12 +826,25 @@ def evaluate_hmaps(data: pd.DataFrame, hmaps: dict[str, dict[str, Any]], dataset
         from localization.common import Pipeline
 
     hmap_key_set = {str(key) for key in hmaps}
+    metadata_index = build_hmap_metadata_index(hmaps)
     for threshold in threshold_list:
         cat_ious = defaultdict(list)
         cat_cnrs = defaultdict(list)
         cat_dices = defaultdict(list)
-        for path, label_text, gtmask, cat in zip(data["path"], data["label_text"], data["gtmasks"], data["category"]):
-            key = resolve_hmap_key(path, label_text, hmap_key_set)
+        for path, label_text, gtmask, cat, case_id in zip(
+            data["path"],
+            data["label_text"],
+            data["gtmasks"],
+            data["category"],
+            data["case_id"] if "case_id" in data.columns else [None] * len(data),
+        ):
+            key = resolve_hmap_key(
+                path,
+                label_text,
+                hmap_key_set,
+                case_id=case_id,
+                metadata_index=metadata_index,
+            )
             if key is None:
                 raise KeyError(str(path) + str(label_text))
             hmap = np.asarray(hmaps[key]["hmap"], dtype=np.float32)
@@ -694,14 +860,14 @@ def evaluate_hmaps(data: pd.DataFrame, hmaps: dict[str, dict[str, Any]], dataset
             cat_cnrs[cat].append(cnr)
             cat_dices[cat].append(dice)
 
-            case_id = key
-            case_metrics[case_id]["path"] = str(path)
-            case_metrics[case_id]["dicom_id"] = Path(str(path)).stem
-            case_metrics[case_id]["label_text"] = label_text
-            case_metrics[case_id]["category"] = cat
-            case_metrics[case_id]["iou"].append(iou)
-            case_metrics[case_id]["cnr"].append(cnr)
-            case_metrics[case_id]["dice"].append(dice)
+            resolved_case_id = str(hmaps[key].get("case_id", key))
+            case_metrics[resolved_case_id]["path"] = str(path)
+            case_metrics[resolved_case_id]["dicom_id"] = Path(str(path)).stem
+            case_metrics[resolved_case_id]["label_text"] = label_text
+            case_metrics[resolved_case_id]["category"] = cat
+            case_metrics[resolved_case_id]["iou"].append(iou)
+            case_metrics[resolved_case_id]["cnr"].append(cnr)
+            case_metrics[resolved_case_id]["dice"].append(dice)
 
         metric_df_iou = metric_dataframe_from_category_values(cat_ious)
         metric_df_cnr = metric_dataframe_from_category_values(cat_cnrs)
@@ -779,36 +945,62 @@ def score_method_hmaps(
     validation_gate_method_name: str = VALIDATION_GATED_METHOD,
     validation_gate_effect_floor: float = 0.02,
     validation_gate_ci_low_floor: float = 0.0,
+    load_data_fn: Any | None = None,
 ) -> dict[str, Any]:
-    from localization.datasets import load_data
+    if load_data_fn is None:
+        from localization.datasets import load_data as load_data_fn
 
     outdir.mkdir(parents=True, exist_ok=True)
-    raw_data = coerce_eval_dataframe(load_data(dataset=dataset), max_cases=max_cases)
+    raw_data = attach_stable_case_ids(
+        coerce_eval_dataframe(load_data_fn(dataset=dataset), max_cases=max_cases),
+        dataset=dataset,
+    )
     data = filter_eval_dataframe_by_categories(raw_data, candidate_categories)
     if data.empty:
         raise ValueError(f"No evaluation rows remain after filtering to candidate_categories={candidate_categories}")
     num_eval_rows_after_category_filter = int(data.shape[0])
 
     hmaps_by_method: dict[str, dict[str, Any]] = {}
-    common_hmap_keys: set[str] | None = None
+    available_methods: list[str] = []
+    missing_methods: list[str] = []
     for method in methods:
         hmap_path = hmaps_root / method / "hmaps.npy"
         if not hmap_path.exists():
-            raise FileNotFoundError(hmap_path)
+            missing_methods.append(method)
+            continue
         hmaps = np.load(hmap_path, allow_pickle=True).item()
         hmaps_by_method[method] = hmaps
-        method_keys = {str(key) for key in hmaps}
-        common_hmap_keys = method_keys if common_hmap_keys is None else common_hmap_keys & method_keys
-    data = filter_eval_dataframe_by_hmap_keys(data, common_hmap_keys or set())
+        available_methods.append(method)
+    if not hmaps_by_method:
+        raise FileNotFoundError(f"No requested method heatmaps found under {hmaps_root}")
+
+    keep_mask = []
+    for _, row in data.iterrows():
+        keep_mask.append(
+            all(
+                resolve_hmap_key(
+                    row["path"],
+                    row["label_text"],
+                    {str(key) for key in hmaps_by_method[method]},
+                    case_id=row.get("case_id"),
+                    metadata_index=build_hmap_metadata_index(hmaps_by_method[method]),
+                )
+                is not None
+                for method in available_methods
+            )
+        )
+    data = data[keep_mask].copy()
+    data.index = range(len(data))
     if data.empty:
         raise ValueError("No evaluation rows have heatmaps for every requested method")
     num_eval_rows_after_hmap_filter = int(data.shape[0])
 
     per_case_by_method: dict[str, pd.DataFrame] = {}
     metric_outputs: dict[str, dict[str, str]] = {}
-    for method in methods:
+    for method in available_methods:
         hmaps = hmaps_by_method[method]
         method_dir = outdir / method
+        method_dir.mkdir(parents=True, exist_ok=True)
         metric_df, per_case = evaluate_hmaps(data, hmaps, dataset=dataset, save_dir=method_dir, margin=margin)
         per_case = add_method_metadata(per_case, method=method, val_fraction=val_fraction, seed=seed)
         per_case.to_csv(method_dir / "per_case_metric.csv", index=False)
@@ -900,9 +1092,9 @@ def score_method_hmaps(
             summary_frames.append(summary)
             per_class_frames.append(per_class)
 
-    delta_table = pd.concat(delta_frames, axis=0, ignore_index=True) if delta_frames else pd.DataFrame()
-    bootstrap_summary = pd.concat(summary_frames, axis=0, ignore_index=True) if summary_frames else pd.DataFrame()
-    per_class_summary = pd.concat(per_class_frames, axis=0, ignore_index=True) if per_class_frames else pd.DataFrame()
+    delta_table = _concat_result_frames(delta_frames)
+    bootstrap_summary = _concat_result_frames(summary_frames)
+    per_class_summary = _concat_result_frames(per_class_frames)
     decision = make_learned_repair_decision(
         bootstrap_summary,
         per_class_summary=per_class_summary,
@@ -930,12 +1122,14 @@ def score_method_hmaps(
         "hmaps_root": str(hmaps_root),
         "outdir": str(outdir),
         "dataset": dataset,
-        "methods": methods,
+        "methods": available_methods,
+        "requested_methods": methods,
+        "missing_methods": missing_methods,
         "candidate_categories": candidate_categories,
         "num_eval_rows_before_category_filter": int(raw_data.shape[0]),
         "num_eval_rows_after_category_filter": num_eval_rows_after_category_filter,
         "num_eval_rows_after_hmap_filter": num_eval_rows_after_hmap_filter,
-        "num_common_hmap_keys": int(len(common_hmap_keys or set())),
+        "num_common_hmap_keys": int(num_eval_rows_after_hmap_filter),
         "num_eval_rows": int(data.shape[0]),
         "decision": decision,
         "validation_gate": validation_gate_payload or {"enabled": False},

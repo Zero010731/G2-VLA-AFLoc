@@ -4,6 +4,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import pandas as pd
 import pytest
+import numpy as np
 
 from anaprior.eval.score_mscxr_learned_repair_metrics import (
     DEFAULT_COMPARISONS,
@@ -20,6 +21,7 @@ from anaprior.eval.score_mscxr_learned_repair_metrics import (
     make_learned_repair_decision,
     make_per_class_learned_repair_decisions,
     paired_bootstrap_summary,
+    score_method_hmaps,
     summarize_comparison,
     write_bootstrap_ci,
 )
@@ -303,6 +305,7 @@ def test_default_methods_include_gated_dcem_without_removing_raw_learned_compari
     assert "disease_pooled_learned" in DEFAULT_METHODS
     assert "phrase_anatomy_dcem" in DEFAULT_METHODS
     assert "dp_msa" in DEFAULT_METHODS
+    assert "afloc_mrsg" in DEFAULT_METHODS
     assert "learned_selective_vs_baseline" in comparison_names
     assert "disease_gated_learned_vs_baseline" in comparison_names
     assert "disease_gated_learned_vs_learned_selective" in comparison_names
@@ -373,6 +376,31 @@ def test_comparison_specs_for_methods_adds_dp_msa_lambda_sweep_comparisons() -> 
     assert "dp_msa_lambda0p02_vs_baseline" in names
     assert "dp_msa_lambda0p02_vs_phrase_anatomy_dcem" in names
     assert "dp_msa_lambda0p02_vs_candidate_shuffled" in names
+
+
+def test_comparison_specs_for_methods_adds_afloc_mrsg_primary_and_secondary_when_present() -> None:
+    specs = comparison_specs_for_methods(
+        {
+            "baseline",
+            "phrase_anatomy_dcem",
+            "afloc_mrsg",
+            "afloc_mrsg_no_router",
+        }
+    )
+    names = {name for name, _, _ in specs}
+
+    assert "afloc_mrsg_vs_baseline" in names
+    assert "afloc_mrsg_vs_phrase_anatomy_dcem" in names
+    assert "afloc_mrsg_no_router_vs_baseline" in names
+    assert "afloc_mrsg_no_router_vs_phrase_anatomy_dcem" in names
+
+
+def test_comparison_specs_for_methods_skips_missing_phrase_anatomy_for_afloc_mrsg() -> None:
+    specs = comparison_specs_for_methods({"baseline", "afloc_mrsg"})
+    names = {name for name, _, _ in specs}
+
+    assert "afloc_mrsg_vs_baseline" in names
+    assert "afloc_mrsg_vs_phrase_anatomy_dcem" not in names
 
 
 def test_decision_requires_baseline_gain_specificity_and_no_macro_harm() -> None:
@@ -454,6 +482,48 @@ def test_decision_rejects_when_specificity_against_shuffled_is_missing() -> None
     assert decision["reason"] == "specificity_against_shuffled_not_met"
 
 
+def test_decision_uses_afloc_mrsg_primary_and_phrase_anatomy_secondary_when_available() -> None:
+    summary = pd.DataFrame(
+        [
+            {
+                "comparison": "afloc_mrsg_vs_baseline",
+                "split": "test",
+                "macro_scope": "macro_candidate",
+                "metric": "cnr",
+                "mean_delta": 0.10,
+                "ci_low": 0.04,
+                "ci_high": 0.16,
+            },
+            {
+                "comparison": "afloc_mrsg_vs_baseline",
+                "split": "test",
+                "macro_scope": "macro_all",
+                "metric": "cnr",
+                "mean_delta": 0.03,
+                "ci_low": 0.00,
+                "ci_high": 0.05,
+            },
+            {
+                "comparison": "afloc_mrsg_vs_phrase_anatomy_dcem",
+                "split": "test",
+                "macro_scope": "macro_candidate",
+                "metric": "cnr",
+                "mean_delta": 0.06,
+                "ci_low": 0.01,
+                "ci_high": 0.10,
+            },
+        ]
+    )
+
+    decision = make_learned_repair_decision(summary, candidate_effect_floor=0.02)
+
+    assert decision["verdict"] == "keep_afloc_mrsg"
+    assert decision["primary_comparison"] == "afloc_mrsg_vs_baseline"
+    assert decision["secondary_comparison"] == "afloc_mrsg_vs_phrase_anatomy_dcem"
+    assert decision["candidate_vs_baseline_cnr_delta"] == 0.1
+    assert decision["replacement_vs_phrase_anatomy_dcem_cnr_delta"] == 0.06
+
+
 def test_per_class_decision_separates_effusion_strong_and_pneumothorax_partial() -> None:
     per_class = pd.DataFrame(
         [
@@ -510,3 +580,68 @@ def test_per_class_decision_separates_effusion_strong_and_pneumothorax_partial()
     assert decisions["Pleural Effusion"]["expected_role"] == "primary_evidence"
     assert decisions["Pneumothorax"]["verdict"] == "directional_partial_success"
     assert decisions["Pneumothorax"]["expected_role"] == "sparse_class_partial_success_allowed"
+
+
+def test_score_method_hmaps_skips_missing_requested_methods_and_reports_them(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hmaps_root = tmp_path / "hmaps"
+    for method in ("baseline", "afloc_mrsg"):
+        method_dir = hmaps_root / method
+        method_dir.mkdir(parents=True, exist_ok=True)
+        np.save(
+            method_dir / "hmaps.npy",
+            {
+                "case-a": {
+                    "hmap": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+                    "path": "a.jpg",
+                    "label_text": "finding A",
+                }
+            },
+        )
+
+    def fake_evaluate_hmaps(data, hmaps, dataset, save_dir, margin=False):
+        return (
+            pd.DataFrame([{"threshold": 0.1, "iou_cat": 0.2, "cnr_cat": 0.3, "dice_cat": 0.4}]),
+            pd.DataFrame(
+                [
+                    {
+                        "case_id": "case-a",
+                        "path": "a.jpg",
+                        "dicom_id": "a",
+                        "label_text": "finding A",
+                        "category": "Pneumothorax",
+                        "iou": 0.2,
+                        "cnr": 0.4 if "afloc_mrsg" in str(save_dir) else 0.3,
+                        "dice": 0.3,
+                    }
+                ]
+            ),
+        )
+
+    monkeypatch.setattr(
+        "anaprior.eval.score_mscxr_learned_repair_metrics.evaluate_hmaps",
+        fake_evaluate_hmaps,
+    )
+
+    result = score_method_hmaps(
+        hmaps_root=hmaps_root,
+        outdir=tmp_path / "score-out",
+        methods=["baseline", "afloc_mrsg", "phrase_anatomy_dcem"],
+        candidate_categories=["Pneumothorax"],
+        dataset="MS_CXR",
+        val_fraction=0.0,
+        bootstrap_replicates=10,
+        seed=0,
+        load_data_fn=lambda dataset, **kwargs: {
+            "path": ["a.jpg"],
+            "label_text": ["finding A"],
+            "category": ["Pneumothorax"],
+            "gtmasks": [np.ones((2, 2), dtype=np.uint8)],
+        },
+    )
+
+    assert result["methods"] == ["baseline", "afloc_mrsg"]
+    assert result["missing_methods"] == ["phrase_anatomy_dcem"]
+    assert result["decision"]["primary_comparison"] == "afloc_mrsg_vs_baseline"
