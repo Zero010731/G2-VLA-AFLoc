@@ -126,6 +126,144 @@ def test_consistency_gate_rejects_teacher_coverage_out_of_range_and_margin_regre
     )
 
 
+def test_consistency_gate_counts_only_teacher_confidence_at_or_above_point_five() -> None:
+    low_confidence_target = TeacherTarget(
+        final_heatmap=torch.ones(1, 1, 2, 2),
+        query_heatmaps=torch.ones(1, 4, 2, 2),
+        confidence=torch.full((1, 1, 2, 2), 0.01, dtype=torch.float32),
+        route_weights=torch.full((1, 4), 0.25, dtype=torch.float32),
+    )
+    boundary_confidence_target = TeacherTarget(
+        final_heatmap=torch.ones(1, 1, 2, 2),
+        query_heatmaps=torch.ones(1, 4, 2, 2),
+        confidence=torch.tensor([[[[0.5, 0.49], [0.5, 0.2]]]], dtype=torch.float32),
+        route_weights=torch.full((1, 4), 0.25, dtype=torch.float32),
+    )
+
+    low_coverage = collect_mrsg_diagnostics(
+        output=_student_output(),
+        positive_scores=torch.tensor([0.9], dtype=torch.float32),
+        negative_scores=torch.tensor([[0.2, 0.3]], dtype=torch.float32),
+        teacher_target=low_confidence_target,
+        phase_b_positive_negative_margin=0.2,
+    )["teacher_confident_coverage"]
+    boundary_coverage = collect_mrsg_diagnostics(
+        output=_student_output(),
+        positive_scores=torch.tensor([0.9], dtype=torch.float32),
+        negative_scores=torch.tensor([[0.2, 0.3]], dtype=torch.float32),
+        teacher_target=boundary_confidence_target,
+        phase_b_positive_negative_margin=0.2,
+    )["teacher_confident_coverage"]
+
+    assert low_coverage == pytest.approx(0.0)
+    assert boundary_coverage == pytest.approx(0.5)
+
+    low_decision = evaluate_phase_gate(
+        "consistency",
+        {
+            **healthy_grounding_diagnostics(),
+            "all_module_gradient_norms_finite": 1.0,
+            "teacher_confident_coverage": low_coverage,
+            "phase_b_positive_negative_margin": 0.2,
+            "positive_negative_margin": 0.3,
+        },
+    )
+    boundary_decision = evaluate_phase_gate(
+        "consistency",
+        {
+            **healthy_grounding_diagnostics(),
+            "all_module_gradient_norms_finite": 1.0,
+            "teacher_confident_coverage": boundary_coverage,
+            "phase_b_positive_negative_margin": 0.2,
+            "positive_negative_margin": 0.3,
+        },
+    )
+
+    assert low_decision.passed is False
+    assert low_decision.reasons == ("teacher_confident_coverage_out_of_range",)
+    assert boundary_decision.passed is True
+
+
+@pytest.mark.parametrize(
+    ("diagnostics", "expected_reasons"),
+    [
+        (
+            {},
+            (
+                "missing_diagnostic:heatmap_std",
+                "missing_diagnostic:max_route_utilization",
+                "missing_diagnostic:query_pairwise_cosine",
+                "missing_diagnostic:positive_negative_margin",
+                "missing_diagnostic:all_module_gradient_norms_finite",
+            ),
+        ),
+        (
+            {"heatmap_std": float("nan")},
+            (
+                "nonfinite_diagnostic:heatmap_std",
+                "missing_diagnostic:max_route_utilization",
+                "missing_diagnostic:query_pairwise_cosine",
+                "missing_diagnostic:positive_negative_margin",
+                "missing_diagnostic:all_module_gradient_norms_finite",
+            ),
+        ),
+        (
+            {"max_route_utilization": float("inf")},
+            (
+                "missing_diagnostic:heatmap_std",
+                "nonfinite_diagnostic:max_route_utilization",
+                "missing_diagnostic:query_pairwise_cosine",
+                "missing_diagnostic:positive_negative_margin",
+                "missing_diagnostic:all_module_gradient_norms_finite",
+            ),
+        ),
+        (
+            {"query_pairwise_cosine": float("-inf")},
+            (
+                "missing_diagnostic:heatmap_std",
+                "missing_diagnostic:max_route_utilization",
+                "nonfinite_diagnostic:query_pairwise_cosine",
+                "missing_diagnostic:positive_negative_margin",
+                "missing_diagnostic:all_module_gradient_norms_finite",
+            ),
+        ),
+    ],
+)
+def test_grounding_gate_fails_closed_for_missing_and_nonfinite_diagnostics(
+    diagnostics: dict[str, float],
+    expected_reasons: tuple[str, ...],
+) -> None:
+    decision = evaluate_phase_gate("grounding", diagnostics)
+
+    assert decision.passed is False
+    assert decision.reasons == expected_reasons
+    assert "heatmap_collapse" not in decision.reasons
+    assert "route_collapse" not in decision.reasons
+    assert "query_collapse" not in decision.reasons
+    assert "nonpositive_phrase_margin" not in decision.reasons
+
+
+def test_grounding_gate_keeps_real_collapse_reasons_for_finite_values() -> None:
+    decision = evaluate_phase_gate(
+        "grounding",
+        {
+            "heatmap_std": 0.0,
+            "max_route_utilization": 0.95,
+            "query_pairwise_cosine": 0.99,
+            "positive_negative_margin": 0.0,
+            "all_module_gradient_norms_finite": 1.0,
+        },
+    )
+
+    assert decision.passed is False
+    assert decision.reasons == (
+        "heatmap_collapse",
+        "route_collapse",
+        "query_collapse",
+        "nonpositive_phrase_margin",
+    )
+
+
 def test_collect_mrsg_diagnostics_returns_anti_collapse_metrics() -> None:
     model = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2))
     loss = model(torch.tensor([[0.2, 0.1, 0.3]], dtype=torch.float32)).sum()

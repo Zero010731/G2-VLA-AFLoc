@@ -14,6 +14,7 @@ from anaprior.models.afloc_mrsg.teacher import TeacherTarget
 HEATMAP_STD_THRESHOLD = 1.0e-3
 MAX_ROUTE_UTILIZATION_THRESHOLD = 0.90
 QUERY_PAIRWISE_COSINE_THRESHOLD = 0.95
+TEACHER_CONFIDENCE_THRESHOLD = 0.5
 TEACHER_COVERAGE_MIN = 0.02
 TEACHER_COVERAGE_MAX = 0.95
 
@@ -91,97 +92,128 @@ def evaluate_phase_gate(
         raise ValueError("phase must be one of locality, grounding, or consistency")
 
     reasons: list[str] = []
-    heatmap_std = _gate_value(diagnostics, "heatmap_std", default=0.0)
-    if heatmap_std <= HEATMAP_STD_THRESHOLD:
+    heatmap_std, heatmap_std_reason = _gate_diagnostic(diagnostics, "heatmap_std")
+    if heatmap_std_reason is not None:
+        reasons.append(heatmap_std_reason)
+    elif heatmap_std <= HEATMAP_STD_THRESHOLD:
         reasons.append("heatmap_collapse")
 
-    max_route_utilization = _gate_value(
+    max_route_utilization, max_route_reason = _gate_diagnostic(
         diagnostics,
         "max_route_utilization",
-        default=1.0,
     )
-    if max_route_utilization >= MAX_ROUTE_UTILIZATION_THRESHOLD:
+    if max_route_reason is not None:
+        reasons.append(max_route_reason)
+    elif max_route_utilization >= MAX_ROUTE_UTILIZATION_THRESHOLD:
         reasons.append("route_collapse")
 
-    query_pairwise_cosine = _gate_value(
+    query_pairwise_cosine, query_pairwise_reason = _gate_diagnostic(
         diagnostics,
         "query_pairwise_cosine",
-        default=1.0,
     )
-    if query_pairwise_cosine >= QUERY_PAIRWISE_COSINE_THRESHOLD:
+    if query_pairwise_reason is not None:
+        reasons.append(query_pairwise_reason)
+    elif query_pairwise_cosine >= QUERY_PAIRWISE_COSINE_THRESHOLD:
         reasons.append("query_collapse")
 
-    positive_negative_margin = _gate_value(
+    positive_negative_margin, positive_negative_reason = _gate_diagnostic(
         diagnostics,
         "positive_negative_margin",
-        default=0.0,
     )
-    if positive_negative_margin <= 0.0:
+    if positive_negative_reason is not None:
+        reasons.append(positive_negative_reason)
+    elif positive_negative_margin <= 0.0:
         reasons.append("nonpositive_phrase_margin")
 
-    all_module_gradient_norms_finite = _gate_value(
+    all_module_gradient_norms_finite, gradient_reason = _gate_diagnostic(
         diagnostics,
         "all_module_gradient_norms_finite",
-        default=0.0,
     )
-    if all_module_gradient_norms_finite < 1.0:
+    if gradient_reason is not None:
+        reasons.append(gradient_reason)
+    elif all_module_gradient_norms_finite < 1.0:
         reasons.append("nonfinite_gradient_norms")
 
     if normalized_phase == "locality":
-        masked_finite = _gate_flag_or_scalar_finite(
+        masked_finite, masked_finite_reason = _gate_flag_or_scalar_finite(
             diagnostics,
             flag_key="masked_reconstruction_finite",
             value_key="masked_reconstruction_loss",
         )
-        untrained_finite = _gate_flag_or_scalar_finite(
+        untrained_finite, untrained_finite_reason = _gate_flag_or_scalar_finite(
             diagnostics,
             flag_key="untrained_masked_reconstruction_finite",
             value_key="untrained_masked_reconstruction_loss",
         )
-        if not masked_finite or not untrained_finite:
+        if masked_finite_reason is not None:
+            reasons.append(masked_finite_reason)
+        if untrained_finite_reason is not None:
+            reasons.append(untrained_finite_reason)
+        if masked_finite_reason is not None or untrained_finite_reason is not None:
+            pass
+        elif not masked_finite or not untrained_finite:
             reasons.append("nonfinite_masked_reconstruction")
         else:
-            masked_loss = _gate_value(
+            masked_loss, masked_loss_reason = _gate_diagnostic(
                 diagnostics,
                 "masked_reconstruction_loss",
-                default=math.inf,
             )
-            untrained_loss = _gate_value(
+            untrained_loss, untrained_loss_reason = _gate_diagnostic(
                 diagnostics,
                 "untrained_masked_reconstruction_loss",
-                default=0.0,
             )
-            locality_ratio = _gate_value(
+            locality_ratio, locality_ratio_reason = _gate_diagnostic(
                 diagnostics,
                 "locality_reconstruction_ratio",
-                default=math.inf,
             )
-            if untrained_loss <= 0.0 or masked_loss >= untrained_loss or locality_ratio >= 1.0:
+            for reason in (
+                masked_loss_reason,
+                untrained_loss_reason,
+                locality_ratio_reason,
+            ):
+                if reason is not None:
+                    reasons.append(reason)
+            if all(
+                reason is None
+                for reason in (
+                    masked_loss_reason,
+                    untrained_loss_reason,
+                    locality_ratio_reason,
+                )
+            ) and (
+                untrained_loss <= 0.0
+                or masked_loss >= untrained_loss
+                or locality_ratio >= 1.0
+            ):
                 reasons.append("locality_reconstruction_not_improved")
 
     if normalized_phase == "consistency":
-        teacher_confident_coverage = _gate_value(
+        teacher_confident_coverage, teacher_coverage_reason = _gate_diagnostic(
             diagnostics,
             "teacher_confident_coverage",
-            default=-1.0,
         )
-        if not TEACHER_COVERAGE_MIN <= teacher_confident_coverage <= TEACHER_COVERAGE_MAX:
+        if teacher_coverage_reason is not None:
+            reasons.append(teacher_coverage_reason)
+        elif not TEACHER_COVERAGE_MIN <= teacher_confident_coverage <= TEACHER_COVERAGE_MAX:
             reasons.append("teacher_confident_coverage_out_of_range")
 
-        phase_b_margin_finite = _gate_flag_or_scalar_finite(
+        phase_b_margin_finite, phase_b_margin_reason = _gate_flag_or_scalar_finite(
             diagnostics,
             flag_key="phase_b_positive_negative_margin_finite",
             value_key="phase_b_positive_negative_margin",
         )
-        if not phase_b_margin_finite:
-            reasons.append("missing_phase_b_margin")
+        if phase_b_margin_reason is not None:
+            reasons.append(phase_b_margin_reason)
+        elif not phase_b_margin_finite:
+            reasons.append("nonfinite_diagnostic:phase_b_positive_negative_margin")
         else:
-            phase_b_margin = _gate_value(
+            phase_b_margin, phase_b_margin_value_reason = _gate_diagnostic(
                 diagnostics,
                 "phase_b_positive_negative_margin",
-                default=math.inf,
             )
-            if positive_negative_margin < phase_b_margin:
+            if phase_b_margin_value_reason is not None:
+                reasons.append(phase_b_margin_value_reason)
+            elif positive_negative_reason is None and positive_negative_margin < phase_b_margin:
                 reasons.append("consistency_margin_below_phase_b")
 
     return PhaseGateDecision(
@@ -260,7 +292,9 @@ def _teacher_confident_coverage(target: TeacherTarget | None) -> float:
     confidence = target.confidence.detach()
     if confidence.numel() == 0 or not torch.isfinite(confidence).all():
         return 0.0
-    return float(confidence.clamp(0.0, 1.0).gt(0.0).float().mean().cpu().item())
+    return float(
+        confidence.clamp(0.0, 1.0).ge(TEACHER_CONFIDENCE_THRESHOLD).float().mean().cpu().item()
+    )
 
 
 def _gradient_norm_diagnostics(model: nn.Module | None) -> dict[str, float]:
@@ -310,15 +344,16 @@ def _finite_scalar(value: torch.Tensor | float | None) -> tuple[float, bool]:
     return scalar, True
 
 
-def _gate_value(diagnostics: Mapping[str, float], key: str, *, default: float) -> float:
-    value = diagnostics.get(key, default)
-    try:
-        scalar = float(value)
-    except (TypeError, ValueError):
-        return default
+def _gate_diagnostic(
+    diagnostics: Mapping[str, float],
+    key: str,
+) -> tuple[float, str | None]:
+    if key not in diagnostics:
+        return 0.0, f"missing_diagnostic:{key}"
+    scalar = _coerce_float(diagnostics.get(key))
     if not math.isfinite(scalar):
-        return default
-    return scalar
+        return 0.0, f"nonfinite_diagnostic:{key}"
+    return scalar, None
 
 
 def _gate_flag_or_scalar_finite(
@@ -326,12 +361,18 @@ def _gate_flag_or_scalar_finite(
     *,
     flag_key: str,
     value_key: str,
-) -> bool:
+) -> tuple[bool, str | None]:
     if flag_key in diagnostics:
-        return _gate_value(diagnostics, flag_key, default=0.0) >= 1.0
-    return value_key in diagnostics and math.isfinite(
-        _coerce_float(diagnostics.get(value_key))
-    )
+        flag_value, flag_reason = _gate_diagnostic(diagnostics, flag_key)
+        if flag_reason is not None:
+            return False, flag_reason
+        return flag_value >= 1.0, None
+    if value_key not in diagnostics:
+        return False, f"missing_diagnostic:{value_key}"
+    value = _coerce_float(diagnostics.get(value_key))
+    if not math.isfinite(value):
+        return False, f"nonfinite_diagnostic:{value_key}"
+    return True, None
 
 
 def _coerce_float(value: object) -> float:
