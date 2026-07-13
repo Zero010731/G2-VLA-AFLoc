@@ -51,6 +51,11 @@ class MRSGOutput:
     query_route_weights: torch.Tensor
     query_reliability: torch.Tensor
     phrase_patch_logits: torch.Tensor
+    masked_predictions: dict[str, torch.Tensor] | None = None
+    source_targets: dict[str, torch.Tensor] | None = None
+    patch_mask: torch.Tensor | None = None
+    query_reconstructed_phrase: torch.Tensor | None = None
+    query_patch_gates: torch.Tensor | None = None
 
     def validate(self) -> None:
         if self.final_heatmap.ndim != 4:
@@ -71,3 +76,45 @@ class MRSGOutput:
             raise ValueError("phrase_patch_logits must have the same batch size")
         if self.phrase_patch_logits.shape[-2:] != (height, width):
             raise ValueError("phrase_patch_logits must have the same spatial shape")
+        self._validate_training_fields(batch, height, width)
+
+    def _validate_training_fields(self, batch: int, height: int, width: int) -> None:
+        if self.masked_predictions is not None or self.source_targets is not None:
+            if self.masked_predictions is None or self.source_targets is None:
+                raise ValueError("masked_predictions and source_targets must be provided together")
+            expected_keys = {"l2", "l", "lf"}
+            if set(self.masked_predictions) != expected_keys:
+                raise ValueError("masked_predictions must contain l2, l, and lf")
+            if set(self.source_targets) != expected_keys:
+                raise ValueError("source_targets must contain l2, l, and lf")
+            for name in ("l2", "l", "lf"):
+                prediction = self.masked_predictions[name]
+                target = self.source_targets[name]
+                if prediction.ndim != 4:
+                    raise ValueError(f"masked_predictions[{name}] must have shape [B,C,H,W]")
+                if prediction.shape[0] != batch or prediction.shape[-2:] != (height, width):
+                    raise ValueError(
+                        f"masked_predictions[{name}] must match final_heatmap batch and spatial shape"
+                    )
+                if target.shape != prediction.shape:
+                    raise ValueError(
+                        f"source_targets[{name}] must match masked_predictions[{name}]"
+                    )
+                if target.requires_grad:
+                    raise ValueError("source_targets must be detached")
+
+        if self.patch_mask is not None:
+            if self.patch_mask.shape != (batch, 1, height, width):
+                raise ValueError("patch_mask must have shape [B,1,H,W]")
+            if self.patch_mask.dtype != torch.bool:
+                raise ValueError("patch_mask must be a boolean tensor")
+
+        if self.query_reconstructed_phrase is not None:
+            if self.query_reconstructed_phrase.ndim != 3:
+                raise ValueError("query_reconstructed_phrase must have shape [B,4,C]")
+            if self.query_reconstructed_phrase.shape[:2] != (batch, 4):
+                raise ValueError("query_reconstructed_phrase must have shape [B,4,C]")
+
+        if self.query_patch_gates is not None:
+            if self.query_patch_gates.shape != (batch, 4, height, width):
+                raise ValueError("query_patch_gates must have shape [B,4,H,W]")

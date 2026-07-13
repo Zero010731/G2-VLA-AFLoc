@@ -58,6 +58,24 @@ def test_mrsg_output_validates_direct_heatmap_shapes() -> None:
     assert output.final_heatmap.shape == (2, 1, 16, 16)
 
 
+def test_mrsg_output_remains_backward_compatible_for_inference_fields() -> None:
+    output = MRSGOutput(
+        final_heatmap=torch.rand(2, 1, 16, 16),
+        query_heatmaps=torch.rand(2, 4, 16, 16),
+        query_route_weights=torch.softmax(torch.rand(2, 4), dim=-1),
+        query_reliability=torch.rand(2, 4),
+        phrase_patch_logits=torch.rand(2, 8, 16, 16),
+    )
+
+    output.validate()
+
+    assert output.masked_predictions is None
+    assert output.source_targets is None
+    assert output.patch_mask is None
+    assert output.query_reconstructed_phrase is None
+    assert output.query_patch_gates is None
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -73,6 +91,44 @@ def test_mrsg_output_rejects_inconsistent_shapes(field, value, message: str) -> 
 
     with pytest.raises(ValueError, match=message):
         output.validate()
+
+
+def test_mrsg_output_validates_optional_training_fields() -> None:
+    output = replace(
+        _valid_output(),
+        masked_predictions={
+            "l2": torch.rand(2, 32, 16, 16),
+            "l": torch.rand(2, 32, 16, 16),
+            "lf": torch.rand(2, 32, 16, 16),
+        },
+        source_targets={
+            "l2": torch.rand(2, 32, 16, 16),
+            "l": torch.rand(2, 32, 16, 16),
+            "lf": torch.rand(2, 32, 16, 16),
+        },
+        patch_mask=torch.zeros(2, 1, 16, 16, dtype=torch.bool),
+        query_reconstructed_phrase=torch.rand(2, 4, 32),
+        query_patch_gates=torch.rand(2, 4, 16, 16),
+    )
+
+    output.validate()
+
+    bad_target = {name: tensor.clone() for name, tensor in output.source_targets.items()}
+    bad_target["l2"] = bad_target["l2"].requires_grad_()
+    with pytest.raises(ValueError, match="source_targets"):
+        replace(output, source_targets=bad_target).validate()
+
+    with pytest.raises(ValueError, match="masked_predictions"):
+        replace(output, masked_predictions={"l2": torch.rand(2, 32, 16, 16)}).validate()
+
+    with pytest.raises(ValueError, match="patch_mask"):
+        replace(output, patch_mask=torch.zeros(2, 1, 16, 16)).validate()
+
+    with pytest.raises(ValueError, match="query_reconstructed_phrase"):
+        replace(output, query_reconstructed_phrase=torch.rand(2, 3, 32)).validate()
+
+    with pytest.raises(ValueError, match="query_patch_gates"):
+        replace(output, query_patch_gates=torch.rand(2, 4, 15, 16)).validate()
 
 
 def test_feature_contracts_are_immutable_tensor_containers() -> None:

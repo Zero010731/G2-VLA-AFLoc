@@ -119,6 +119,11 @@ class AFLocMRSG(nn.Module):
             query_route_weights=router.route_weights,
             query_reliability=query_reliability,
             phrase_patch_logits=phrase_patch_logits,
+            masked_predictions=pyramid.masked_prediction,
+            source_targets=pyramid.source_targets,
+            patch_mask=patch_mask,
+            query_reconstructed_phrase=grounding.query_reconstructed_phrase,
+            query_patch_gates=grounding.query_patch_gates,
         )
         output.validate()
         self.last_forward_debug = {

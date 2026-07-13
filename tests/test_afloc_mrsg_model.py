@@ -19,6 +19,23 @@ def model_class():
     return AFLocMRSG
 
 
+def _masked_prediction_loss(output) -> torch.Tensor:
+    assert output.masked_predictions is not None
+    assert output.source_targets is not None
+    assert output.patch_mask is not None
+    mask = output.patch_mask.to(dtype=output.final_heatmap.dtype)
+    masked_positions = mask.sum().clamp_min(1.0)
+    losses = []
+    for name in ("l2", "l", "lf"):
+        prediction = output.masked_predictions[name]
+        target = output.source_targets[name]
+        losses.append(
+            ((prediction - target).square() * mask).sum()
+            / (masked_positions * target.shape[1])
+        )
+    return torch.stack(losses).mean()
+
+
 def test_afloc_mrsg_forward_returns_direct_nonconstant_heatmap() -> None:
     torch.manual_seed(31)
     AFLocMRSG = model_class()
@@ -34,6 +51,11 @@ def test_afloc_mrsg_forward_returns_direct_nonconstant_heatmap() -> None:
     assert output.query_route_weights.shape == (2, 4)
     assert output.query_reliability.shape == (2, 4)
     assert output.phrase_patch_logits.shape == (2, 7, 16, 16)
+    assert output.masked_predictions is not None
+    assert output.source_targets is not None
+    assert output.patch_mask is not None
+    assert output.query_reconstructed_phrase is not None
+    assert output.query_patch_gates is not None
 
 
 def test_afloc_mrsg_has_no_dcem_region_or_disease_id_inputs() -> None:
@@ -99,6 +121,52 @@ def test_afloc_mrsg_keeps_afloc_inputs_frozen_at_parameter_boundary() -> None:
     assert phrase_features.sentence_embedding.grad is None
     assert phrase_features.disease_description_embedding.grad is None
     assert model.feature_pyramid.projections["l2"].weight.grad is not None
+
+
+def test_afloc_mrsg_combined_task10_loss_preserves_auxiliary_gradients() -> None:
+    torch.manual_seed(47)
+    AFLocMRSG = model_class()
+    model = AFLocMRSG(make_test_config(), image_channels=(32, 64, 128))
+    patch_mask = torch.zeros(2, 1, 16, 16, dtype=torch.bool)
+    patch_mask[:, :, 3:10, 4:12] = True
+    image_features = AFLocFeatureBatch(
+        img_emb_l2=torch.rand(2, 32, 16, 16, requires_grad=True),
+        img_emb_l=torch.rand(2, 64, 8, 8, requires_grad=True),
+        img_emb_lf=torch.rand(2, 128, 4, 4, requires_grad=True),
+        image_gray=torch.rand(2, 1, 224, 224, requires_grad=True),
+    )
+
+    output = model(image_features, fake_phrase_features(), patch_mask=patch_mask)
+    assert output.query_reconstructed_phrase is not None
+    loss = (
+        output.final_heatmap.mean()
+        + _masked_prediction_loss(output)
+        + output.query_reconstructed_phrase.square().mean()
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert loss.item() > 0.0
+    assert image_features.img_emb_l2.grad is None
+    assert image_features.img_emb_l.grad is None
+    assert image_features.img_emb_lf.grad is None
+    assert image_features.image_gray.grad is None
+    assert model.feature_pyramid.mask_token.grad is not None
+    assert model.feature_pyramid.mask_token.grad.abs().sum().item() > 0.0
+    for predictor in model.feature_pyramid.predictors.values():
+        grad = predictor[-1].weight.grad
+        assert grad is not None
+        assert grad.abs().sum().item() > 0.0
+    assert model.grounder.output_norm.weight.grad is not None
+    assert model.grounder.output_norm.weight.grad.abs().sum().item() > 0.0
+    assert model.phrase_router.route_head.weight.grad is not None
+    assert model.phrase_router.route_head.weight.grad.abs().sum().item() > 0.0
+    assert model.decoder.output_head.weight.grad is not None
+    assert model.decoder.output_head.weight.grad.abs().sum().item() > 0.0
+    for index, operator in enumerate(model.query_bank.operators):
+        grad = operator.output_head.weight.grad
+        assert grad is not None, f"query operator {index} did not receive gradients"
+        assert grad.abs().sum().item() > 0.0
 
 
 def test_afloc_mrsg_phrase_patch_logits_are_route_weighted_across_queries() -> None:
