@@ -8,6 +8,8 @@ import torch
 from anaprior.models.afloc_mrsg.contracts import MRSGOutput
 from anaprior.models.afloc_mrsg.losses import (
     MRSGGroupedLoss,
+    _pairwise_query_cosine,
+    _total_variation,
     TeacherTarget,
     compute_mrsg_loss,
     cross_modal_grounding_loss,
@@ -80,7 +82,16 @@ def test_grounding_loss_rewards_positive_phrase_margin() -> None:
 
 def test_query_regularization_detects_constant_and_identical_maps() -> None:
     collapsed = torch.ones(4, 4, 8, 8) * 0.5
-    diverse = torch.rand(4, 4, 8, 8)
+    diverse = torch.zeros(4, 4, 8, 8)
+    diverse[:, 0, 3:5, 3:5] = 1.0
+    diverse[:, 1] = torch.linspace(0.2, 0.8, 8).view(1, 1, 8).expand(4, 8, 8)
+    diverse[:, 2, :, :4] = 0.2
+    diverse[:, 2, :, 4:] = 0.8
+    diverse[:, 3] = (
+        torch.tensor([0.1, 0.3, 0.6, 0.9, 0.9, 0.6, 0.3, 0.1])
+        .view(1, 1, 8)
+        .expand(4, 8, 8)
+    )
     assert query_regularization_loss(
         collapsed,
         uniform_routes(4),
@@ -110,6 +121,53 @@ def test_compute_mrsg_loss_exposes_exactly_four_top_level_groups() -> None:
         "teacher_confident_coverage",
     }
     assert not any(key.startswith("w_") for key in loss.diagnostics)
+
+
+def test_query_regularization_uses_exact_equal_component_ratio() -> None:
+    query_maps = torch.tensor(
+        [
+            [
+                [[0.90, 0.80], [0.70, 0.60]],
+                [[0.10, 0.40], [0.80, 0.20]],
+                [[0.30, 0.90], [0.50, 0.70]],
+                [[0.20, 0.60], [0.80, 0.40]],
+            ],
+            [
+                [[0.60, 0.55], [0.50, 0.45]],
+                [[0.90, 0.30], [0.20, 0.70]],
+                [[0.40, 0.10], [0.80, 0.60]],
+                [[0.75, 0.25], [0.35, 0.95]],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+    route_weights = torch.tensor(
+        [
+            [0.55, 0.15, 0.20, 0.10],
+            [0.40, 0.30, 0.20, 0.10],
+        ],
+        dtype=torch.float32,
+    )
+
+    route_balance = (route_weights.mean(dim=0) - 0.25).square().mean()
+    diversity = _pairwise_query_cosine(query_maps).mean()
+    noncollapse = torch.relu(0.02 - query_maps.var(dim=(-2, -1), unbiased=False)).mean()
+
+    focal = query_maps[:, 0:1]
+    diffuse = query_maps[:, 1:2]
+    boundary = query_maps[:, 2:3]
+    structural = query_maps[:, 3:4]
+    structure = (
+        torch.relu(focal.mean(dim=(-2, -1)) - 0.35).mean()
+        + _total_variation(diffuse)
+        + _total_variation(boundary)
+        + (structural - structural.flip(-1)).abs().mean()
+    )
+
+    expected = 0.25 * (route_balance + diversity + noncollapse + structure)
+    actual = query_regularization_loss(query_maps, route_weights)
+
+    assert torch.isclose(actual, expected)
 
 
 def test_group_losses_produce_finite_gradients_without_target_gradients() -> None:

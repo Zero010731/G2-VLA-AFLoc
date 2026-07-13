@@ -308,9 +308,7 @@ def _operator_structure_loss(query_heatmaps: torch.Tensor) -> torch.Tensor:
     diffuse_smooth = _total_variation(diffuse)
     boundary_continuity = _total_variation(boundary)
     structural_symmetry = (structural - structural.flip(-1)).abs().mean()
-    return 0.05 * (
-        focal_area + diffuse_smooth + boundary_continuity + structural_symmetry
-    )
+    return focal_area + diffuse_smooth + boundary_continuity + structural_symmetry
 
 
 def _total_variation(tensor: torch.Tensor) -> torch.Tensor:
