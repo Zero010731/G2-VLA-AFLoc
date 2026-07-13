@@ -7,13 +7,7 @@ import torch
 from torch.nn import functional as F
 
 from anaprior.models.afloc_mrsg.contracts import MRSGOutput
-
-
-@dataclass(frozen=True)
-class TeacherTarget:
-    final_heatmap: torch.Tensor
-    query_heatmaps: torch.Tensor
-    confidence: torch.Tensor
+from anaprior.models.afloc_mrsg.teacher import TeacherTarget
 
 
 @dataclass(frozen=True)
@@ -264,9 +258,14 @@ def _validate_teacher_target(
         raise ValueError("teacher query_heatmaps must match student query heatmaps")
     if target.confidence.shape != student_final.shape:
         raise ValueError("teacher confidence must have shape [B,1,H,W]")
+    if target.route_weights.shape != (student_final.shape[0], 4):
+        raise ValueError("teacher route_weights must have shape [B,4]")
     _require_finite("teacher final_heatmap", target.final_heatmap)
     _require_finite("teacher query_heatmaps", target.query_heatmaps)
     _require_finite("teacher confidence", target.confidence)
+    _require_finite("teacher route_weights", target.route_weights)
+    if target.route_weights.requires_grad:
+        raise ValueError("teacher route_weights must be detached")
 
 
 def _weighted_mse(

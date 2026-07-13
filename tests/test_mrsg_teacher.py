@@ -132,6 +132,41 @@ def test_teacher_confidence_is_detached_product_of_agreement_terms() -> None:
     assert torch.allclose(confidence, torch.ones_like(confidence))
 
 
+def test_route_confidence_requires_finite_nonzero_route_weights() -> None:
+    aligned = torch.tensor([[[[0.1, 0.8], [0.3, 0.6]]]])
+    invalid_routes = (
+        torch.zeros(1, 4),
+        torch.tensor([[float("nan"), 0.0, 0.0, 0.0]]),
+        torch.tensor([[float("inf"), 0.0, 0.0, 0.0]]),
+        torch.tensor([[1.0, -1.0, 0.0, 0.0]]),
+    )
+
+    for bad_routes in invalid_routes:
+        confidence = teacher_confidence(
+            scale_heatmaps=(aligned, aligned),
+            weak_heatmap=aligned,
+            strong_heatmap=aligned,
+            teacher_route_weights=bad_routes,
+            student_route_weights=torch.full((1, 4), 0.25),
+            positive_scores=torch.tensor([0.9]),
+            negative_scores=torch.tensor([[0.1, 0.2]]),
+            margin=0.2,
+        )
+        assert torch.equal(confidence, torch.zeros_like(confidence))
+
+    valid_confidence = teacher_confidence(
+        scale_heatmaps=(aligned, aligned),
+        weak_heatmap=aligned,
+        strong_heatmap=aligned,
+        teacher_route_weights=torch.full((1, 4), 0.25),
+        student_route_weights=torch.full((1, 4), 0.25),
+        positive_scores=torch.tensor([0.9]),
+        negative_scores=torch.tensor([[0.1, 0.2]]),
+        margin=0.2,
+    )
+    assert torch.allclose(valid_confidence, torch.ones_like(valid_confidence))
+
+
 def test_opposing_maps_and_negative_phrase_margins_lower_confident_coverage() -> None:
     aligned = torch.tensor([[[[0.05, 0.95], [0.15, 0.85]]]])
     aligned_confidence = teacher_confidence(

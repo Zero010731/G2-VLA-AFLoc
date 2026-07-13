@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from anaprior.models.afloc_mrsg.contracts import MRSGOutput
+from anaprior.models.afloc_mrsg import losses, teacher
 from anaprior.models.afloc_mrsg.losses import (
     MRSGGroupedLoss,
     _pairwise_query_cosine,
@@ -59,7 +60,12 @@ def _teacher_target(batch: int = 2, height: int = 4, width: int = 4) -> TeacherT
         final_heatmap=torch.rand(batch, 1, height, width, requires_grad=True),
         query_heatmaps=torch.rand(batch, 4, height, width, requires_grad=True),
         confidence=torch.ones(batch, 1, height, width, requires_grad=True),
+        route_weights=torch.full((batch, 4), 0.25),
     )
+
+
+def test_teacher_target_is_canonical_between_teacher_and_losses() -> None:
+    assert teacher.TeacherTarget is losses.TeacherTarget
 
 
 def test_grounding_loss_rewards_positive_phrase_margin() -> None:
@@ -238,6 +244,7 @@ def test_absent_and_zero_confidence_teacher_are_backward_safe() -> None:
         final_heatmap=torch.rand(2, 1, 4, 4, requires_grad=True),
         query_heatmaps=torch.rand(2, 4, 4, 4, requires_grad=True),
         confidence=torch.zeros(2, 1, 4, 4, requires_grad=True),
+        route_weights=torch.full((2, 4), 0.25),
     )
     loss = teacher_equivariance_loss(student_final, student_queries, zero_conf)
     loss.backward()
@@ -285,4 +292,42 @@ def test_loss_validation_rejects_bad_shapes_and_nonfinite_values() -> None:
         query_regularization_loss(
             torch.full((2, 4, 4, 4), float("nan")),
             uniform_routes(2),
+        )
+
+    with pytest.raises(ValueError, match="route_weights must have shape \\[B,4\\]"):
+        teacher_equivariance_loss(
+            torch.rand(2, 1, 4, 4),
+            torch.rand(2, 4, 4, 4),
+            TeacherTarget(
+                final_heatmap=torch.rand(2, 1, 4, 4),
+                query_heatmaps=torch.rand(2, 4, 4, 4),
+                confidence=torch.ones(2, 1, 4, 4),
+                route_weights=torch.ones(2, 3),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="route_weights must contain finite values"):
+        teacher_equivariance_loss(
+            torch.rand(2, 1, 4, 4),
+            torch.rand(2, 4, 4, 4),
+            TeacherTarget(
+                final_heatmap=torch.rand(2, 1, 4, 4),
+                query_heatmaps=torch.rand(2, 4, 4, 4),
+                confidence=torch.ones(2, 1, 4, 4),
+                route_weights=torch.tensor(
+                    [[float("nan"), 0.0, 0.0, 0.0], [0.25, 0.25, 0.25, 0.25]]
+                ),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="route_weights must be detached"):
+        teacher_equivariance_loss(
+            torch.rand(2, 1, 4, 4),
+            torch.rand(2, 4, 4, 4),
+            TeacherTarget(
+                final_heatmap=torch.rand(2, 1, 4, 4),
+                query_heatmaps=torch.rand(2, 4, 4, 4),
+                confidence=torch.ones(2, 1, 4, 4),
+                route_weights=torch.full((2, 4), 0.25, requires_grad=True),
+            ),
         )

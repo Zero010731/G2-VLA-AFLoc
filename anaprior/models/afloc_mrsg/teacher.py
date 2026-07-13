@@ -207,12 +207,24 @@ def _route_agreement(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    teacher = teacher_route_weights.detach().to(device=device, dtype=dtype).nan_to_num(0.0)
-    student = student_route_weights.detach().to(device=device, dtype=dtype).nan_to_num(0.0)
-    teacher = teacher / teacher.sum(dim=1, keepdim=True).clamp_min(1.0e-6)
-    student = student / student.sum(dim=1, keepdim=True).clamp_min(1.0e-6)
+    teacher = teacher_route_weights.detach().to(device=device, dtype=dtype)
+    student = student_route_weights.detach().to(device=device, dtype=dtype)
+    teacher_sum, teacher_valid = _route_weight_sum_and_mask(teacher)
+    student_sum, student_valid = _route_weight_sum_and_mask(student)
+    teacher = teacher.nan_to_num(0.0) / teacher_sum.clamp_min(1.0)
+    student = student.nan_to_num(0.0) / student_sum.clamp_min(1.0)
     agreement = 1.0 - 0.5 * (teacher - student).abs().sum(dim=1, keepdim=True)
-    return agreement.clamp(0.0, 1.0)[:, :, None, None]
+    valid = teacher_valid & student_valid
+    agreement = torch.where(valid, agreement.clamp(0.0, 1.0), torch.zeros_like(agreement))
+    return agreement[:, :, None, None]
+
+
+def _route_weight_sum_and_mask(route_weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    finite = torch.isfinite(route_weights).all(dim=1, keepdim=True)
+    sanitized = route_weights.nan_to_num(0.0)
+    total = sanitized.sum(dim=1, keepdim=True)
+    valid = finite & total.gt(0.0)
+    return total, valid
 
 
 def _phrase_margin_confidence(
