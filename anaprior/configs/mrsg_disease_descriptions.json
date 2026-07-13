@@ -1,0 +1,10 @@
+{
+  "Atelectasis": "partial loss of lung aeration that produces linear, plate-like, or locally increased pulmonary density",
+  "Cardiomegaly": "enlargement of the cardiac silhouette relative to the thoracic cavity",
+  "Consolidation": "airspace filling that obscures normal lung markings and may form a dense focal or multifocal opacity",
+  "Edema": "pulmonary interstitial or airspace fluid accumulation that may appear diffuse or multifocal",
+  "Lung Opacity": "a nonspecific increase in pulmonary density that reduces the visibility of underlying lung markings",
+  "Pleural Effusion": "fluid in the pleural space that changes the normally sharp interface between lung and thoracic boundary",
+  "Pneumonia": "infectious airspace inflammation that may produce focal, multifocal, or patchy pulmonary opacity",
+  "Pneumothorax": "air in the pleural space that may produce a visible pleural boundary with reduced peripheral lung markings"
+}
