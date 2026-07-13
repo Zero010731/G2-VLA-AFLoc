@@ -12,7 +12,6 @@ from typing import Any, Callable, Mapping
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
 
 from anaprior.features.afloc_mrsg_encoder import FrozenAFLocMRSGEncoder
 from anaprior.models.afloc_mrsg import AFLocMRSG, MRSGConfig
@@ -191,23 +190,7 @@ def load_runtime(
         "reference": reference,
         "afloc_encoder": encoder,
         "mrsg_model": model,
-        "transform": _default_image_transform(),
     }
-
-
-def _default_image_transform() -> Callable[[Image.Image], torch.Tensor]:
-    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
-
-    def transform(image: Image.Image) -> torch.Tensor:
-        resized = image.resize((224, 224))
-        array = np.asarray(resized, dtype=np.float32)
-        if array.ndim == 2:
-            array = np.repeat(array[:, :, None], 3, axis=2)
-        tensor = torch.from_numpy(array.transpose(2, 0, 1)) / 255.0
-        return (tensor - mean) / std
-
-    return transform
 
 
 def default_encode_case(
@@ -216,12 +199,24 @@ def default_encode_case(
     device: str,
 ) -> dict[str, Any]:
     runtime = checkpoint["runtime"]
-    image = Image.open(row["path"]).convert("RGB")
-    tensor = runtime["transform"](image).unsqueeze(0).to(torch.device(device))
+    encoder = runtime["afloc_encoder"]
+    afloc_model = getattr(encoder, "afloc", None)
+    if afloc_model is None or not hasattr(afloc_model, "process_img"):
+        raise RuntimeError(
+            "AFLoc runtime must expose afloc_encoder.afloc.process_img(paths, device, flag=0) "
+            "to honor the loaded checkpoint preprocessing contract."
+        )
+    try:
+        tensor = afloc_model.process_img([row["path"]], device, flag=0)
+    except TypeError as exc:
+        raise RuntimeError(
+            "AFLoc runtime process_img must accept (paths, device, flag=0) for checkpoint-driven preprocessing."
+        ) from exc
+    tensor = tensor.to(torch.device(device))
     phrase = str(row["label_text"])
     disease_description = str(row["category"]) or phrase
     with torch.no_grad():
-        image_features, phrase_features = runtime["afloc_encoder"](
+        image_features, phrase_features = encoder(
             tensor,
             [phrase],
             [disease_description],

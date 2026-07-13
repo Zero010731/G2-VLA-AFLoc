@@ -9,6 +9,7 @@ import torch
 
 from anaprior.eval.eval_mscxr_afloc_mrsg import (
     build_mscxr_afloc_mrsg_hmaps,
+    default_encode_case,
     main,
 )
 from tests.mrsg_test_utils import test_config as make_test_config
@@ -185,4 +186,105 @@ def test_cli_rejects_prepared_and_gate_arguments_before_loading_models(tmp_path:
                 str(tmp_path / "out"),
                 "--validation-gate",
             ]
+        )
+
+
+def test_default_encode_case_uses_afloc_process_img_contract(tmp_path: Path) -> None:
+    ckpt = write_fake_mrsg_checkpoint(tmp_path)
+    image_path = tmp_path / "process-img.jpg"
+    image_path.write_bytes(b"not-an-image-needed")
+    processed = torch.full((1, 3, 7, 5), 0.25, dtype=torch.float32)
+    seen: dict[str, object] = {}
+
+    class FakeRuntimeAFLoc:
+        def process_img(self, paths, device, flag=0):
+            seen["paths"] = list(paths)
+            seen["device"] = device
+            seen["flag"] = flag
+            return processed.clone()
+
+    class FakeRuntimeEncoder:
+        def __init__(self) -> None:
+            self.afloc = FakeRuntimeAFLoc()
+
+        def __call__(self, images, phrases, disease_descriptions, device):
+            seen["images"] = images.detach().clone()
+            seen["phrases"] = list(phrases)
+            seen["descriptions"] = list(disease_descriptions)
+            seen["encoder_device"] = device
+            return (
+                type("ImageFeatures", (), {"image_gray": images.mean(dim=1, keepdim=True)})(),
+                object(),
+            )
+
+    class FakeMRSGModel:
+        def __call__(self, image_features, phrase_features):
+            assert torch.equal(image_features.image_gray, processed.mean(dim=1, keepdim=True))
+            heatmap = torch.tensor([[[[1.0, 3.0], [5.0, 7.0]]]], dtype=torch.float32)
+            return type(
+                "Output",
+                (),
+                {
+                    "final_heatmap": heatmap,
+                    "query_route_weights": torch.tensor([[0.4, 0.3, 0.2, 0.1]], dtype=torch.float32),
+                    "query_reliability": torch.tensor([[0.7, 0.2, 0.1]], dtype=torch.float32),
+                },
+            )()
+
+    runtime = {
+        "afloc_encoder": FakeRuntimeEncoder(),
+        "mrsg_model": FakeMRSGModel(),
+    }
+    checkpoint_bundle = {
+        "path": ckpt,
+        "reference": {"path": ckpt, "payload": {}},
+        "runtime": runtime,
+        "afloc_checkpoint": tmp_path / "afloc.ckpt",
+    }
+
+    result = build_mscxr_afloc_mrsg_hmaps(
+        data_rows=[
+            {
+                "path": str(image_path),
+                "label_text": "right pleural effusion",
+                "category": "Pleural Effusion",
+            }
+        ],
+        dataset="MS_CXR",
+        checkpoint=ckpt,
+        afloc_checkpoint=tmp_path / "afloc.ckpt",
+        encode_case=lambda row, checkpoint, device: default_encode_case(row, checkpoint_bundle, device),
+        device="cpu",
+    )
+
+    assert seen["paths"] == [str(image_path)]
+    assert seen["flag"] == 0
+    assert seen["device"] == "cpu"
+    assert torch.equal(seen["images"], processed)
+    assert seen["phrases"] == ["right pleural effusion"]
+    assert seen["descriptions"] == ["Pleural Effusion"]
+    assert result.case_diagnostics[0]["hmap_max"] == pytest.approx(1.0)
+
+
+def test_default_encode_case_fails_clearly_without_afloc_process_img(tmp_path: Path) -> None:
+    ckpt = write_fake_mrsg_checkpoint(tmp_path)
+    checkpoint_bundle = {
+        "path": ckpt,
+        "reference": {"path": ckpt, "payload": {}},
+        "runtime": {
+            "afloc_encoder": object(),
+            "mrsg_model": object(),
+        },
+        "afloc_checkpoint": tmp_path / "afloc.ckpt",
+    }
+
+    with pytest.raises(RuntimeError, match="afloc_encoder\\.afloc\\.process_img"):
+        default_encode_case(
+            {
+                "path": str(tmp_path / "missing-process-img.jpg"),
+                "label_text": "opacity",
+                "category": "Pneumonia",
+            },
+            checkpoint_bundle,
+            "cpu",
         )

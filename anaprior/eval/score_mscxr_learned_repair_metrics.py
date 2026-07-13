@@ -110,8 +110,22 @@ def stable_int(value: str) -> int:
 
 
 def _concat_result_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
-    cleaned = [frame.dropna(axis=1, how="all") for frame in frames if not frame.empty]
-    return pd.concat(cleaned, axis=0, ignore_index=True) if cleaned else pd.DataFrame()
+    non_empty = [frame.copy() for frame in frames if not frame.empty]
+    if not non_empty:
+        return pd.DataFrame()
+
+    columns: list[str] = []
+    for frame in non_empty:
+        for column in frame.columns:
+            if column not in columns:
+                columns.append(str(column))
+
+    records: list[dict[str, Any]] = []
+    for frame in non_empty:
+        for raw_record in frame.to_dict(orient="records"):
+            record = {column: raw_record.get(column, np.nan) for column in columns}
+            records.append(record)
+    return pd.DataFrame.from_records(records, columns=columns)
 
 
 def assign_split(case_id: str, val_fraction: float = 0.3, seed: int = 0) -> str:
@@ -582,7 +596,11 @@ def _summary_row(summary: pd.DataFrame, comparison: str, macro_scope: str, metri
     ]
     if rows.empty:
         return None
-    return rows.iloc[0]
+    row = rows.iloc[0]
+    required = pd.to_numeric(pd.Series([row.get("mean_delta"), row.get("ci_low"), row.get("ci_high")]), errors="coerce")
+    if required.isna().any():
+        return None
+    return row
 
 
 def _per_class_row(per_class_summary: pd.DataFrame, comparison: str, category: str, metric: str = "cnr") -> pd.Series | None:
@@ -596,7 +614,11 @@ def _per_class_row(per_class_summary: pd.DataFrame, comparison: str, category: s
     ]
     if rows.empty:
         return None
-    return rows.iloc[0]
+    row = rows.iloc[0]
+    required = pd.to_numeric(pd.Series([row.get("mean_delta"), row.get("ci_low"), row.get("ci_high")]), errors="coerce")
+    if required.isna().any():
+        return None
+    return row
 
 
 def _candidate_role(category: str) -> str:

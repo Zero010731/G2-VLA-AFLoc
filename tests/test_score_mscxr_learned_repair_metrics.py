@@ -9,6 +9,7 @@ import numpy as np
 from anaprior.eval.score_mscxr_learned_repair_metrics import (
     DEFAULT_COMPARISONS,
     DEFAULT_METHODS,
+    _concat_result_frames,
     build_validation_gate_decisions,
     build_validation_gated_per_case,
     build_paired_delta_table,
@@ -269,6 +270,60 @@ def test_write_bootstrap_ci_handles_string_task_names_on_pandas2(tmp_path) -> No
     assert (tmp_path / "test_iou_summary_results.csv").exists()
     assert ci.iloc[-1]["name"] == "mean"
     assert ci[["lower", "mean", "upper"]].iloc[-1].notna().all()
+
+
+def test_concat_result_frames_preserves_all_nan_summary_columns_for_insufficient_evidence() -> None:
+    summary = _concat_result_frames(
+        [
+            pd.DataFrame(
+                [
+                    {
+                        "comparison": "learned_selective_vs_baseline",
+                        "split": "test",
+                        "macro_scope": "macro_candidate",
+                        "metric": "cnr",
+                        "mean_delta": np.nan,
+                        "ci_low": np.nan,
+                        "ci_high": np.nan,
+                    }
+                ]
+            ),
+            pd.DataFrame(
+                [
+                    {
+                        "comparison": "learned_selective_vs_baseline",
+                        "split": "test",
+                        "macro_scope": "macro_all",
+                        "metric": "cnr",
+                        "mean_delta": np.nan,
+                        "ci_low": np.nan,
+                        "ci_high": np.nan,
+                    }
+                ]
+            ),
+            pd.DataFrame(
+                [
+                    {
+                        "comparison": "learned_selective_vs_candidate_shuffled",
+                        "split": "test",
+                        "macro_scope": "macro_candidate",
+                        "metric": "cnr",
+                        "mean_delta": np.nan,
+                        "ci_low": np.nan,
+                        "ci_high": np.nan,
+                    }
+                ]
+            ),
+        ]
+    )
+
+    assert {"mean_delta", "ci_low", "ci_high"} <= set(summary.columns)
+    assert summary[["mean_delta", "ci_low", "ci_high"]].isna().all().all()
+
+    decision = make_learned_repair_decision(summary)
+
+    assert decision["verdict"] == "insufficient_evidence"
+    assert decision["reason"] == "missing_test_cnr_summary"
 
 
 def test_evaluate_hmaps_rejects_empty_eval_data_before_bootstrap(tmp_path) -> None:
