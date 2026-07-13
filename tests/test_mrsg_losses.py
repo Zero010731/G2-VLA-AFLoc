@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pytest
+import torch
+
+from anaprior.models.afloc_mrsg.contracts import MRSGOutput
+from anaprior.models.afloc_mrsg.losses import (
+    MRSGGroupedLoss,
+    TeacherTarget,
+    compute_mrsg_loss,
+    cross_modal_grounding_loss,
+    masked_patch_distillation_loss,
+    query_regularization_loss,
+    teacher_equivariance_loss,
+)
+from tests.mrsg_test_utils import uniform_routes
+
+
+@dataclass(frozen=True)
+class LossWeights:
+    w_ground: float = 1.0
+    w_teacher: float = 1.0
+    w_mask: float = 1.0
+    w_query: float = 1.0
+
+
+def _student_output(batch: int = 2, height: int = 4, width: int = 4) -> MRSGOutput:
+    final_heatmap = torch.rand(batch, 1, height, width, requires_grad=True)
+    query_heatmaps = torch.rand(batch, 4, height, width, requires_grad=True)
+    return MRSGOutput(
+        final_heatmap=final_heatmap,
+        query_heatmaps=query_heatmaps,
+        query_route_weights=torch.softmax(
+            torch.randn(batch, 4, requires_grad=True),
+            dim=-1,
+        ),
+        query_reliability=torch.rand(batch, 4, requires_grad=True),
+        phrase_patch_logits=torch.randn(batch, 3, height, width, requires_grad=True),
+        masked_predictions={
+            name: torch.randn(batch, 5, height, width, requires_grad=True)
+            for name in ("l2", "l", "lf")
+        },
+        source_targets={
+            name: torch.randn(batch, 5, height, width)
+            for name in ("l2", "l", "lf")
+        },
+        patch_mask=torch.ones(batch, 1, height, width, dtype=torch.bool),
+        query_reconstructed_phrase=torch.randn(batch, 4, 6, requires_grad=True),
+        query_patch_gates=torch.rand(batch, 4, height, width, requires_grad=True),
+    )
+
+
+def _teacher_target(batch: int = 2, height: int = 4, width: int = 4) -> TeacherTarget:
+    return TeacherTarget(
+        final_heatmap=torch.rand(batch, 1, height, width, requires_grad=True),
+        query_heatmaps=torch.rand(batch, 4, height, width, requires_grad=True),
+        confidence=torch.ones(batch, 1, height, width, requires_grad=True),
+    )
+
+
+def test_grounding_loss_rewards_positive_phrase_margin() -> None:
+    good = cross_modal_grounding_loss(
+        positive_scores=torch.tensor([0.8, 0.7]),
+        negative_scores=torch.tensor([[0.1, 0.2], [0.2, 0.3]]),
+        reconstructed_phrase=torch.eye(2).unsqueeze(1).expand(2, 4, 2),
+        target_phrase=torch.eye(2),
+        margin=0.2,
+    )
+    bad = cross_modal_grounding_loss(
+        positive_scores=torch.tensor([0.2, 0.2]),
+        negative_scores=torch.tensor([[0.5, 0.4], [0.6, 0.5]]),
+        reconstructed_phrase=torch.zeros(2, 4, 2),
+        target_phrase=torch.eye(2),
+        margin=0.2,
+    )
+    assert good < bad
+
+
+def test_query_regularization_detects_constant_and_identical_maps() -> None:
+    collapsed = torch.ones(4, 4, 8, 8) * 0.5
+    diverse = torch.rand(4, 4, 8, 8)
+    assert query_regularization_loss(
+        collapsed,
+        uniform_routes(4),
+    ) > query_regularization_loss(diverse, uniform_routes(4))
+
+
+def test_compute_mrsg_loss_exposes_exactly_four_top_level_groups() -> None:
+    student = _student_output()
+    loss = compute_mrsg_loss(
+        student=student,
+        positive_scores=torch.rand(2, requires_grad=True),
+        negative_scores=torch.rand(2, 2, requires_grad=True),
+        pyramid=student,
+        teacher_target=_teacher_target(),
+        config=LossWeights(),
+        target_phrase=torch.rand(2, 6),
+    )
+
+    assert isinstance(loss, MRSGGroupedLoss)
+    assert loss.total.shape == ()
+    assert set(loss.diagnostics) >= {
+        "grounding",
+        "teacher",
+        "mask",
+        "query",
+        "positive_negative_margin",
+        "teacher_confident_coverage",
+    }
+    assert not any(key.startswith("w_") for key in loss.diagnostics)
+
+
+def test_group_losses_produce_finite_gradients_without_target_gradients() -> None:
+    positive = torch.tensor([0.3, 0.7], requires_grad=True)
+    negative = torch.tensor([[0.6, 0.5], [0.2, 0.1]], requires_grad=True)
+    reconstructed = torch.randn(2, 4, 6, requires_grad=True)
+    target_phrase = torch.randn(2, 6, requires_grad=True)
+    grounding = cross_modal_grounding_loss(
+        positive,
+        negative,
+        reconstructed,
+        target_phrase,
+    )
+
+    student_final = torch.rand(2, 1, 4, 4, requires_grad=True)
+    student_queries = torch.rand(2, 4, 4, 4, requires_grad=True)
+    teacher = _teacher_target()
+    teacher_loss = teacher_equivariance_loss(student_final, student_queries, teacher)
+
+    predictions = {
+        name: torch.randn(2, 3, 4, 4, requires_grad=True)
+        for name in ("l2", "l", "lf")
+    }
+    targets = {
+        name: torch.randn(2, 3, 4, 4, requires_grad=True)
+        for name in ("l2", "l", "lf")
+    }
+    mask_loss = masked_patch_distillation_loss(
+        predictions,
+        targets,
+        torch.ones(2, 1, 4, 4, dtype=torch.bool),
+    )
+
+    query_maps = torch.rand(2, 4, 4, 4, requires_grad=True)
+    route_logits = torch.randn(2, 4, requires_grad=True)
+    route_weights = torch.softmax(route_logits, dim=-1)
+    query_loss = query_regularization_loss(query_maps, route_weights)
+
+    total = grounding + teacher_loss + mask_loss + query_loss
+    total.backward()
+
+    for tensor in (positive, negative, reconstructed, student_final, student_queries, query_maps):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+        assert tensor.grad.abs().sum().item() > 0.0
+    assert route_logits.grad is not None
+    assert torch.isfinite(route_logits.grad).all()
+    assert route_logits.grad.abs().sum().item() > 0.0
+
+    assert target_phrase.grad is None
+    for tensor in teacher.__dict__.values():
+        assert tensor.grad is None
+    for tensor in targets.values():
+        assert tensor.grad is None
+
+
+def test_absent_and_zero_confidence_teacher_are_backward_safe() -> None:
+    student_final = torch.rand(2, 1, 4, 4, requires_grad=True)
+    student_queries = torch.rand(2, 4, 4, 4, requires_grad=True)
+
+    absent = teacher_equivariance_loss(student_final, student_queries, None)
+    absent.backward(retain_graph=True)
+    assert student_final.grad is not None
+    assert student_final.grad.abs().sum().item() == 0.0
+
+    student_final.grad.zero_()
+    zero_conf = TeacherTarget(
+        final_heatmap=torch.rand(2, 1, 4, 4, requires_grad=True),
+        query_heatmaps=torch.rand(2, 4, 4, 4, requires_grad=True),
+        confidence=torch.zeros(2, 1, 4, 4, requires_grad=True),
+    )
+    loss = teacher_equivariance_loss(student_final, student_queries, zero_conf)
+    loss.backward()
+    assert student_final.grad.abs().sum().item() == 0.0
+    assert zero_conf.final_heatmap.grad is None
+    assert zero_conf.query_heatmaps.grad is None
+    assert zero_conf.confidence.grad is None
+
+
+def test_empty_mask_distillation_is_backward_safe_and_zero() -> None:
+    predictions = {
+        name: torch.randn(2, 3, 4, 4, requires_grad=True)
+        for name in ("l2", "l", "lf")
+    }
+    targets = {
+        name: torch.randn(2, 3, 4, 4, requires_grad=True)
+        for name in ("l2", "l", "lf")
+    }
+
+    loss = masked_patch_distillation_loss(
+        predictions,
+        targets,
+        torch.zeros(2, 1, 4, 4, dtype=torch.bool),
+    )
+    loss.backward()
+
+    assert loss.item() == 0.0
+    for tensor in predictions.values():
+        assert tensor.grad is not None
+        assert tensor.grad.abs().sum().item() == 0.0
+    for tensor in targets.values():
+        assert tensor.grad is None
+
+
+def test_loss_validation_rejects_bad_shapes_and_nonfinite_values() -> None:
+    with pytest.raises(ValueError, match="positive_scores"):
+        cross_modal_grounding_loss(
+            torch.rand(2, 1),
+            torch.rand(2, 2),
+            torch.rand(2, 4, 3),
+            torch.rand(2, 3),
+        )
+
+    with pytest.raises(ValueError, match="finite"):
+        query_regularization_loss(
+            torch.full((2, 4, 4, 4), float("nan")),
+            uniform_routes(2),
+        )
