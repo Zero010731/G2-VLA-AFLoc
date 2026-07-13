@@ -83,8 +83,8 @@ _UNCERTAINTY_PATTERN = re.compile(
     r"suggestive of|may represent|could represent|cannot exclude|can not exclude)\b",
     re.IGNORECASE,
 )
-_CLAUSE_BOUNDARY_PATTERN = re.compile(
-    r"(?:\bbut\b|\bhowever\b|\balthough\b|\byet\b|;|:)",
+_LOCAL_SCOPE_BOUNDARY_PATTERN = re.compile(
+    r"(?:\b(?:and|or|but|while|whereas|however|although|yet)\b|[,;:])",
     re.IGNORECASE,
 )
 _SENTENCE_PATTERN = re.compile(r"[^.!?\n]+(?:[.!?]+|$)")
@@ -124,19 +124,60 @@ def _sentences(report: str) -> Iterable[str]:
 
 
 def _finding_matches(sentence: str) -> Iterable[Tuple[int, int, str]]:
+    accepted: List[Tuple[int, int, str]] = []
     for finding, patterns in _FINDING_PATTERNS.items():
         matches = []
         for pattern in patterns:
             matches.extend(re.finditer(pattern, sentence, re.IGNORECASE))
-        if matches:
-            earliest = min(matches, key=lambda item: (item.start(), -len(item.group(0))))
-            yield earliest.start(), earliest.end(), finding
+        selected: List[Tuple[int, int, str]] = []
+        for match in sorted(
+            matches,
+            key=lambda item: (item.start(), -len(item.group(0))),
+        ):
+            span = (match.start(), match.end(), finding)
+            if any(span[0] < item[1] and item[0] < span[1] for item in selected):
+                continue
+            selected.append(span)
+        accepted.extend(selected)
+    yield from sorted(accepted, key=lambda item: (item[0], item[1], item[2]))
 
 
-def _preceding_clause(sentence: str, finding_start: int) -> str:
-    prefix = sentence[:finding_start]
-    boundaries = list(_CLAUSE_BOUNDARY_PATTERN.finditer(prefix))
-    return prefix[boundaries[-1].end() :] if boundaries else prefix
+def _local_scopes(
+    sentence: str,
+    mentions: Sequence[Tuple[int, int, str]],
+) -> Iterable[Tuple[str, int, int, Tuple[Tuple[int, int, str], ...]]]:
+    boundaries = []
+    for boundary in _LOCAL_SCOPE_BOUNDARY_PATTERN.finditer(sentence):
+        connector = boundary.group(0).strip().lower()
+        is_hard_boundary = connector in {
+            ";",
+            ":",
+            "but",
+            "while",
+            "whereas",
+            "however",
+            "although",
+            "yet",
+        }
+        has_left_mention = any(end <= boundary.start() for _, end, _ in mentions)
+        has_right_mention = any(start >= boundary.end() for start, _, _ in mentions)
+        if is_hard_boundary or (has_left_mention and has_right_mention):
+            boundaries.append(boundary)
+
+    scope_start = 0
+    connector = ""
+    for boundary in (*boundaries, None):
+        scope_end = boundary.start() if boundary is not None else len(sentence)
+        scoped_mentions = tuple(
+            mention
+            for mention in mentions
+            if mention[0] >= scope_start and mention[1] <= scope_end
+        )
+        if scoped_mentions:
+            yield connector, scope_start, scope_end, scoped_mentions
+        if boundary is not None:
+            connector = boundary.group(0).strip().lower()
+            scope_start = boundary.end()
 
 
 def _nearest_terms(
@@ -179,6 +220,19 @@ def _laterality(sentence: str, finding_start: int) -> Tuple[str, ...]:
         )
         if nearest_unilateral is None or nearest_bilateral <= nearest_unilateral:
             return ("left", "right")
+    left_matches = list(_LATERALITY_PATTERNS["left"].finditer(sentence))
+    right_matches = list(_LATERALITY_PATTERNS["right"].finditer(sentence))
+    for left in left_matches:
+        for right in right_matches:
+            first, second = sorted((left, right), key=lambda match: match.start())
+            connector = sentence[first.end() : second.start()]
+            both_before = second.end() <= finding_start
+            both_after = first.start() >= finding_start
+            if (
+                re.fullmatch(r"\s*(?:and|or|/|&)\s*", connector, re.IGNORECASE)
+                and (both_before or both_after)
+            ):
+                return ("left", "right")
     return _nearest_terms(
         sentence,
         finding_start,
@@ -193,19 +247,47 @@ def mine_report_phrases(report: str) -> Tuple[MinedPhrase, ...]:
         raise TypeError("report must be text")
     phrases: List[MinedPhrase] = []
     for sentence in _sentences(report):
-        for start, _, finding in sorted(_finding_matches(sentence)):
-            preceding_clause = _preceding_clause(sentence, start)
-            phrases.append(
-                MinedPhrase(
-                    text=sentence,
-                    finding=finding,
-                    laterality=_laterality(sentence, start),
-                    location_terms=_nearest_terms(sentence, start, _LOCATION_PATTERNS),
-                    severity_terms=_nearest_terms(sentence, start, _SEVERITY_PATTERNS),
-                    uncertain=bool(_UNCERTAINTY_PATTERN.search(sentence)),
-                    negated=bool(_NEGATION_PATTERN.search(preceding_clause)),
+        mentions = tuple(_finding_matches(sentence))
+        carry_or_negation = False
+        for connector, scope_start, scope_end, scoped_mentions in _local_scopes(
+            sentence,
+            mentions,
+        ):
+            raw_scope = sentence[scope_start:scope_end]
+            leading_whitespace = len(raw_scope) - len(raw_scope.lstrip())
+            scope = raw_scope.strip()
+            first_start = scoped_mentions[0][0] - scope_start - leading_whitespace
+            leading_context = scope[:first_start]
+            local_leading_negation = bool(_NEGATION_PATTERN.search(leading_context))
+            inherited_negation = connector == "or" and carry_or_negation
+            for start, _, finding in scoped_mentions:
+                local_start = start - scope_start - leading_whitespace
+                preceding_context = scope[:local_start]
+                phrases.append(
+                    MinedPhrase(
+                        text=scope,
+                        finding=finding,
+                        laterality=_laterality(scope, local_start),
+                        location_terms=_nearest_terms(
+                            scope,
+                            local_start,
+                            _LOCATION_PATTERNS,
+                        ),
+                        severity_terms=_nearest_terms(
+                            scope,
+                            local_start,
+                            _SEVERITY_PATTERNS,
+                        ),
+                        uncertain=bool(
+                            _UNCERTAINTY_PATTERN.search(preceding_context)
+                        ),
+                        negated=(
+                            inherited_negation
+                            or bool(_NEGATION_PATTERN.search(preceding_context))
+                        ),
+                    )
                 )
-            )
+            carry_or_negation = local_leading_negation or inherited_negation
     return tuple(phrases)
 
 
@@ -226,38 +308,44 @@ def _supported_phrases(report: str) -> Tuple[MinedPhrase, ...]:
 
 
 def _candidate_is_supported(
-    source_phrase: MinedPhrase,
     candidate: MinedPhrase,
     supported: Sequence[MinedPhrase],
+    replacement_kind: str,
 ) -> bool:
     for evidence in supported:
         if evidence.finding != candidate.finding:
             continue
-        if candidate.finding != source_phrase.finding:
+        if replacement_kind == "finding":
             return True
-        if candidate.laterality and set(candidate.laterality) & set(evidence.laterality):
+        if (
+            replacement_kind == "laterality"
+            and set(candidate.laterality) & set(evidence.laterality)
+        ):
             return True
-        if candidate.location_terms and set(candidate.location_terms) & set(evidence.location_terms):
-            return True
-        if not candidate.laterality and not candidate.location_terms:
-            return True
-        if not evidence.laterality and not evidence.location_terms:
+        if (
+            replacement_kind == "location"
+            and set(candidate.location_terms) & set(evidence.location_terms)
+        ):
             return True
     return False
 
 
 def _append_candidate(
     output: List[MinedPhrase],
-    source_phrase: MinedPhrase,
     candidate: MinedPhrase,
     supported: Sequence[MinedPhrase],
+    replacement_kind: str,
     normalized_report: str,
     seen: set,
 ) -> None:
     normalized_text = " ".join(candidate.text.lower().split())
     if not normalized_text or normalized_text in normalized_report:
         return
-    if normalized_text in seen or _candidate_is_supported(source_phrase, candidate, supported):
+    if normalized_text in seen or _candidate_is_supported(
+        candidate,
+        supported,
+        replacement_kind,
+    ):
         return
     seen.add(normalized_text)
     output.append(candidate)
@@ -292,7 +380,14 @@ def build_counterfactuals(
         if replaced_text is None:
             continue
         candidate = replace(phrase, text=replaced_text, finding=finding)
-        _append_candidate(candidates, phrase, candidate, supported, normalized_report, seen)
+        _append_candidate(
+            candidates,
+            candidate,
+            supported,
+            "finding",
+            normalized_report,
+            seen,
+        )
         if len(candidates) >= max_negatives:
             return tuple(candidates)
 
@@ -322,7 +417,14 @@ def build_counterfactuals(
                 text=replaced_text,
                 laterality=(target_side,),
             )
-            _append_candidate(candidates, phrase, candidate, supported, normalized_report, seen)
+            _append_candidate(
+                candidates,
+                candidate,
+                supported,
+                "laterality",
+                normalized_report,
+                seen,
+            )
             if len(candidates) >= max_negatives:
                 return tuple(candidates)
 
@@ -345,7 +447,14 @@ def build_counterfactuals(
                 text=replaced_text,
                 location_terms=(target_location,),
             )
-            _append_candidate(candidates, phrase, candidate, supported, normalized_report, seen)
+            _append_candidate(
+                candidates,
+                candidate,
+                supported,
+                "location",
+                normalized_report,
+                seen,
+            )
             if len(candidates) >= max_negatives:
                 return tuple(candidates)
 
