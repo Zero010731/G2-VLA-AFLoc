@@ -18,6 +18,13 @@ from anaprior.models.afloc_mrsg.teacher import GeometryTransform, transform_phra
 FORBIDDEN_SPATIAL_KEYS = frozenset(
     {"box", "bbox", "mask", "region", "coordinates", "oracle", "dcem"}
 )
+GEOMETRY_METADATA_KEYS = (
+    "horizontal_flip",
+    "crop_top",
+    "crop_left",
+    "crop_height",
+    "crop_width",
+)
 
 
 def _normalize_key(key: object) -> str:
@@ -40,16 +47,24 @@ def _assert_no_forbidden_spatial_fields(value: Any, prefix: str = "") -> None:
         raise ValueError(f"Manifest contains forbidden spatial supervision fields: {unique}")
 
 
-def _stable_fraction(seed: int, index: int, label: str) -> float:
-    digest = hashlib.md5(f"{seed}:{index}:{label}".encode("utf-8")).hexdigest()
+def _stable_fraction(seed: int, index: int, label: str, *, epoch: int = 0) -> float:
+    digest = hashlib.md5(f"{seed}:{index}:{epoch}:{label}".encode("utf-8")).hexdigest()
     return int(digest[:8], 16) / float(0xFFFFFFFF)
 
 
-def _noise_like(image: torch.Tensor, seed: int, index: int, label: str, std: float) -> torch.Tensor:
+def _noise_like(
+    image: torch.Tensor,
+    seed: int,
+    index: int,
+    label: str,
+    std: float,
+    *,
+    epoch: int = 0,
+) -> torch.Tensor:
     if std <= 0.0:
         return image.clone()
     generator = torch.Generator()
-    digest = hashlib.md5(f"{seed}:{index}:{label}".encode("utf-8")).hexdigest()
+    digest = hashlib.md5(f"{seed}:{index}:{epoch}:{label}".encode("utf-8")).hexdigest()
     generator.manual_seed(int(digest[:16], 16))
     noise = torch.randn(image.shape, generator=generator, dtype=image.dtype)
     return (image + noise * float(std)).clamp(0.0, 1.0)
@@ -66,11 +81,45 @@ def _load_manifest(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _scalar_value(value: object) -> int | bool:
+    if isinstance(value, torch.Tensor):
+        value = value.item()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bool):
+        return value
+    return int(value)
+
+
+def geometry_metadata(transform: GeometryTransform) -> dict[str, int | bool]:
+    return {
+        "horizontal_flip": bool(transform.horizontal_flip),
+        "crop_top": int(transform.crop_top),
+        "crop_left": int(transform.crop_left),
+        "crop_height": int(transform.crop_height if transform.crop_height is not None else 0),
+        "crop_width": int(transform.crop_width if transform.crop_width is not None else 0),
+    }
+
+
+def geometry_transform_from_metadata(metadata: Mapping[str, object]) -> GeometryTransform:
+    missing = [key for key in GEOMETRY_METADATA_KEYS if key not in metadata]
+    if missing:
+        raise KeyError(f"Geometry metadata is missing keys: {', '.join(missing)}")
+    return GeometryTransform(
+        horizontal_flip=bool(_scalar_value(metadata["horizontal_flip"])),
+        crop_top=int(_scalar_value(metadata["crop_top"])),
+        crop_left=int(_scalar_value(metadata["crop_left"])),
+        crop_height=int(_scalar_value(metadata["crop_height"])),
+        crop_width=int(_scalar_value(metadata["crop_width"])),
+    )
+
+
 class MRSGDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
         *,
         manifest_path: Path | str,
+        image_root: Path | str | None = None,
         image_size: tuple[int, int] = (224, 224),
         crop_size: tuple[int, int] | None = None,
         seed: int = 13,
@@ -81,6 +130,7 @@ class MRSGDataset(Dataset[dict[str, Any]]):
         strong_noise_std: float = 0.08,
     ) -> None:
         self.manifest_path = Path(manifest_path)
+        self.image_root = None if image_root is None else Path(image_root).resolve()
         self.rows = _load_manifest(self.manifest_path)
         self.image_size = tuple(int(value) for value in image_size)
         self.crop_size = (
@@ -94,12 +144,31 @@ class MRSGDataset(Dataset[dict[str, Any]]):
         self.equivariance_horizontal_flip_prob = float(equivariance_horizontal_flip_prob)
         self.weak_noise_std = float(weak_noise_std)
         self.strong_noise_std = float(strong_noise_std)
+        self.epoch = 0
 
     def __len__(self) -> int:
         return len(self.rows)
 
-    def _load_image(self, image_path: str) -> torch.Tensor:
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _resolve_image_path(self, image_path: str) -> Path:
         path = Path(image_path)
+        if path.is_absolute():
+            return path
+        base = self.manifest_path.parent.resolve() if self.image_root is None else self.image_root
+        resolved = (base / path).resolve()
+        if self.image_root is not None:
+            try:
+                resolved.relative_to(self.image_root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Resolved image path outside image_root: {path}"
+                ) from exc
+        return resolved
+
+    def _load_image(self, image_path: str) -> torch.Tensor:
+        path = self._resolve_image_path(image_path)
         if not path.exists():
             raise FileNotFoundError(f"missing image: {path}")
         try:
@@ -122,11 +191,12 @@ class MRSGDataset(Dataset[dict[str, Any]]):
         max_left = max(width - crop_width, 0)
         use_crop = (
             crop_height < height or crop_width < width
-        ) and _stable_fraction(self.seed, index, "geometry") < self.geometry_prob
+        ) and _stable_fraction(self.seed, index, "geometry", epoch=self.epoch) < self.geometry_prob
         crop_top = 0
         crop_left = max_left if use_crop else 0
         return GeometryTransform(
-            horizontal_flip=_stable_fraction(self.seed, index, "flip") < self.horizontal_flip_prob,
+            horizontal_flip=_stable_fraction(self.seed, index, "flip", epoch=self.epoch)
+            < self.horizontal_flip_prob,
             crop_top=crop_top,
             crop_left=crop_left,
             crop_height=crop_height if use_crop else height,
@@ -135,7 +205,12 @@ class MRSGDataset(Dataset[dict[str, Any]]):
 
     def _equivariance_transform(self, index: int, base: GeometryTransform) -> GeometryTransform:
         return GeometryTransform(
-            horizontal_flip=_stable_fraction(self.seed, index, "equivariance_flip")
+            horizontal_flip=_stable_fraction(
+                self.seed,
+                index,
+                "equivariance_flip",
+                epoch=self.epoch,
+            )
             < self.equivariance_horizontal_flip_prob,
             crop_top=base.crop_top,
             crop_left=base.crop_left,
@@ -161,8 +236,22 @@ class MRSGDataset(Dataset[dict[str, Any]]):
         equivariance_transform = self._equivariance_transform(index, geometry)
         geometry_applied = self._apply_geometry(image, geometry)
         equivariance_image = self._apply_geometry(image, equivariance_transform)
-        weak_image = _noise_like(geometry_applied, self.seed, index, "weak", self.weak_noise_std)
-        strong_image = _noise_like(geometry_applied, self.seed, index, "strong", self.strong_noise_std)
+        weak_image = _noise_like(
+            geometry_applied,
+            self.seed,
+            index,
+            "weak",
+            self.weak_noise_std,
+            epoch=self.epoch,
+        )
+        strong_image = _noise_like(
+            geometry_applied,
+            self.seed,
+            index,
+            "strong",
+            self.strong_noise_std,
+            epoch=self.epoch,
+        )
 
         phrase = transform_phrase(str(row["phrase"]), geometry)
         negative_phrases = [
@@ -182,8 +271,8 @@ class MRSGDataset(Dataset[dict[str, Any]]):
             "weak_image": weak_image,
             "strong_image": strong_image,
             "equivariance_image": equivariance_image,
-            "geometry": geometry,
-            "equivariance_transform": equivariance_transform,
+            "geometry": geometry_metadata(geometry),
+            "equivariance_transform": geometry_metadata(equivariance_transform),
             "subject_id": str(row["subject_id"]),
             "study_id": str(row["study_id"]),
             "dicom_id": str(row["dicom_id"]),
@@ -193,7 +282,11 @@ class MRSGDataset(Dataset[dict[str, Any]]):
             "equivariance_phrase": equivariance_phrase,
             "equivariance_negative_phrases": equivariance_negative_phrases,
             "disease_description": str(row["disease_description"]),
-        }
+}
 
 
-__all__ = ["MRSGDataset"]
+__all__ = [
+    "MRSGDataset",
+    "geometry_metadata",
+    "geometry_transform_from_metadata",
+]

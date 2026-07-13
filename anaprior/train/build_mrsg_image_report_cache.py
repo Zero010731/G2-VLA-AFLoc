@@ -98,7 +98,11 @@ def _build_rows(
         for column in passthrough_columns:
             if column in raw:
                 _assert_no_forbidden_spatial_fields({column: raw[column]})
-        phrases = [item for item in mine_report_phrases(str(raw["report"])) if not item.negated]
+        phrases = [
+            item
+            for item in mine_report_phrases(str(raw["report"]))
+            if (not item.negated) and (not item.uncertain)
+        ]
         for phrase in phrases:
             negatives = build_counterfactuals(phrase, str(raw["report"]), max_negatives=8)
             output.append(

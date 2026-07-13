@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from PIL import Image
 
 from tests.mrsg_test_utils import (
     write_descriptions,
@@ -93,6 +94,48 @@ def test_manifest_builder_rejects_recursive_forbidden_spatial_keys(tmp_path: Pat
         )
 
 
+def test_manifest_builder_skips_negated_and_uncertain_phrases(tmp_path: Path) -> None:
+    from anaprior.train.build_mrsg_image_report_cache import build_mrsg_image_report_cache
+
+    mimic_csv = tmp_path / "mimic.csv"
+    pd.DataFrame(
+        [
+            {
+                "path": "files/p11/p11000001/s51000001/train.jpg",
+                "report": "possible small right apical pneumothorax. no pleural effusion.",
+            },
+            {
+                "path": "files/p12/p12000001/s52000001/valid.jpg",
+                "report": "left basilar opacity.",
+            },
+        ]
+    ).to_csv(mimic_csv, index=False)
+
+    report = build_mrsg_image_report_cache(
+        mimic_csv=mimic_csv,
+        mscxr_json=write_fake_mscxr_json(tmp_path),
+        descriptions_json=write_descriptions(tmp_path),
+        outdir=tmp_path / "out",
+        valid_fraction=0.5,
+        seed=13,
+    )
+
+    train_rows = [
+        json.loads(line)
+        for line in Path(report["train_jsonl"]).read_text(encoding="utf-8").splitlines()
+    ]
+    valid_rows = [
+        json.loads(line)
+        for line in Path(report["valid_jsonl"]).read_text(encoding="utf-8").splitlines()
+    ]
+    all_rows = train_rows + valid_rows
+
+    assert len(all_rows) == 1
+    assert all_rows[0]["phrase"] == "left basilar opacity."
+    assert all_rows[0]["finding"] == "Lung Opacity"
+    assert report["train_rows"] + report["valid_rows"] == 1
+
+
 def test_manifest_builder_is_deterministic_and_audits_patient_overlap(tmp_path: Path) -> None:
     from anaprior.train.build_mrsg_image_report_cache import build_mrsg_image_report_cache
 
@@ -139,6 +182,50 @@ def test_manifest_builder_is_deterministic_and_audits_patient_overlap(tmp_path: 
     ).read_text(encoding="utf-8")
     assert first["sanity"]["train_valid_subject_overlap"] == 0
     assert first["protocol"]["sanity"]["train_valid_subject_overlap"] == 0
+
+
+def test_builder_output_loads_with_dataset_image_root(tmp_path: Path) -> None:
+    from anaprior.data.mrsg_dataset import MRSGDataset
+    from anaprior.train.build_mrsg_image_report_cache import build_mrsg_image_report_cache
+
+    image_root = tmp_path / "images"
+    image_path = image_root / "files" / "p11" / "p11000001" / "s51000001" / "train.jpg"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (8, 8), color=(32, 64, 96)).save(image_path)
+
+    mimic_csv = tmp_path / "mimic.csv"
+    pd.DataFrame(
+        [
+            {
+                "path": "files/p11/p11000001/s51000001/train.jpg",
+                "report": "small right apical pneumothorax.",
+            }
+        ]
+    ).to_csv(mimic_csv, index=False)
+
+    report = build_mrsg_image_report_cache(
+        mimic_csv=mimic_csv,
+        mscxr_json=write_fake_mscxr_json(tmp_path),
+        descriptions_json=write_descriptions(tmp_path),
+        outdir=tmp_path / "out",
+        valid_fraction=0.5,
+        seed=13,
+    )
+
+    dataset = MRSGDataset(
+        manifest_path=report["train_jsonl"] if report["train_rows"] else report["valid_jsonl"],
+        image_root=image_root,
+        image_size=(6, 6),
+        crop_size=(4, 4),
+        seed=7,
+    )
+
+    sample = dataset[0]
+
+    assert sample["subject_id"] == "11000001"
+    assert sample["study_id"] == "51000001"
+    assert sample["dicom_id"] == "train"
+    assert sample["original_image"].shape == (3, 6, 6)
 
 
 def test_manifest_builder_cli_help_and_main(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
