@@ -39,6 +39,7 @@ tensorboard/
 
 # Temporary files
 tmp/
+.worktrees/
 *.pickle
 
 # Medical image files
