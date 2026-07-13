@@ -107,6 +107,31 @@ def test_structural_operator_uses_nonlocal_left_right_relations() -> None:
     assert base.auxiliary["relation_tokens"].shape[:3] == (1, 8, 6)
 
 
+@pytest.mark.parametrize(("height", "width"), [(1, 1), (2, 1)])
+def test_structural_operator_handles_degenerate_width_with_finite_gradients(
+    height: int,
+    width: int,
+) -> None:
+    torch.manual_seed(13)
+    bank = MorphologyQueryBank(feature_dim=16, num_heads=4)
+    pyramid, edge_features, phrase_vector = make_inputs(batch=1, height=height, width=width)
+    pyramid.requires_grad_()
+
+    structural = bank(pyramid, edge_features, phrase_vector)[3]
+
+    assert structural.features.shape == (1, 16, height, width)
+    assert structural.heatmap_logits.shape == (1, 1, height, width)
+    assert torch.isfinite(structural.features).all()
+    assert torch.isfinite(structural.heatmap_logits).all()
+    assert torch.isfinite(structural.reliability).all()
+
+    (structural.heatmap_logits.mean() + structural.features.mean()).backward()
+
+    assert pyramid.grad is not None
+    assert torch.isfinite(pyramid.grad).all()
+    assert pyramid.grad.abs().sum().item() > 0.0
+
+
 def test_invalid_shapes_raise_value_errors() -> None:
     bank = MorphologyQueryBank(feature_dim=16, num_heads=4)
     pyramid, edge_features, phrase_vector = make_inputs()

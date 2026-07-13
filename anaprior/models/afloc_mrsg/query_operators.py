@@ -232,11 +232,21 @@ class StructuralRelationQueryOperator(_BaseQueryOperator):
         left_width = width // 2
         right_width = width - left_width
         pair_width = min(left_width, right_width)
-        left = pyramid[:, :, :, :pair_width]
-        right = torch.flip(pyramid[:, :, :, width - pair_width :], dims=(-1,))
-        relation_input = torch.cat((left, right, (left - right).abs()), dim=1)
-        relation_tokens = relation_input.permute(0, 2, 3, 1)
-        flat_relations = relation_tokens.reshape(batch_size, height * pair_width, channels * 3)
+        if pair_width == 0:
+            column_context = pyramid.mean(dim=-1, keepdim=True)
+            global_context = pyramid.mean(dim=(-2, -1), keepdim=True).expand(-1, -1, height, 1)
+            relation_input = torch.cat(
+                (column_context, global_context, (column_context - global_context).abs()),
+                dim=1,
+            )
+            relation_tokens = relation_input.permute(0, 2, 3, 1)
+            flat_relations = relation_tokens.reshape(batch_size, height, channels * 3)
+        else:
+            left = pyramid[:, :, :, :pair_width]
+            right = torch.flip(pyramid[:, :, :, width - pair_width :], dims=(-1,))
+            relation_input = torch.cat((left, right, (left - right).abs()), dim=1)
+            relation_tokens = relation_input.permute(0, 2, 3, 1)
+            flat_relations = relation_tokens.reshape(batch_size, height * pair_width, channels * 3)
         relation_embedding = self.relation_projection(flat_relations)
         phrase_token = self.phrase_projection(phrase_vector).unsqueeze(1)
         attended, attention_weights = self.relation_attention(
@@ -245,15 +255,19 @@ class StructuralRelationQueryOperator(_BaseQueryOperator):
             value=relation_embedding,
             need_weights=True,
         )
-        relation_map = attended.transpose(1, 2).reshape(batch_size, channels, height, pair_width)
-        broadcast = torch.zeros_like(pyramid)
-        broadcast[:, :, :, :pair_width] = relation_map
-        broadcast[:, :, :, width - pair_width :] = torch.flip(relation_map, dims=(-1,))
-        if width > pair_width * 2:
-            middle_start = pair_width
-            middle_end = width - pair_width
-            middle = relation_map.mean(dim=-1, keepdim=True).expand(-1, -1, -1, middle_end - middle_start)
-            broadcast[:, :, :, middle_start:middle_end] = middle
+        if pair_width == 0:
+            relation_map = attended.transpose(1, 2).reshape(batch_size, channels, height, 1)
+            broadcast = relation_map.expand(-1, -1, -1, width)
+        else:
+            relation_map = attended.transpose(1, 2).reshape(batch_size, channels, height, pair_width)
+            broadcast = torch.zeros_like(pyramid)
+            broadcast[:, :, :, :pair_width] = relation_map
+            broadcast[:, :, :, width - pair_width :] = torch.flip(relation_map, dims=(-1,))
+            if width > pair_width * 2:
+                middle_start = pair_width
+                middle_end = width - pair_width
+                middle = relation_map.mean(dim=-1, keepdim=True).expand(-1, -1, -1, middle_end - middle_start)
+                broadcast[:, :, :, middle_start:middle_end] = middle
         features = self.context_projection(pyramid + broadcast)
         heatmap_logits = self.output_head(features)
         return QueryOperatorOutput(
