@@ -12,6 +12,9 @@ set -euo pipefail
 # Resume from a later stage:
 #   START_STAGE=7 bash scripts/run_afloc_mrsg_full_server.sh
 #
+# Explicit same-phase resume only:
+#   PHASE_B_RESUME_CHECKPOINT=/path/to/mrsg_phase_b_latest.pt bash scripts/run_afloc_mrsg_full_server.sh
+#
 # Preview commands without running them:
 #   DRY_RUN=1 bash scripts/run_afloc_mrsg_full_server.sh
 
@@ -31,7 +34,9 @@ START_STAGE="${START_STAGE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 ALLOW_DIRTY_OUTROOT="${ALLOW_DIRTY_OUTROOT:-0}"
-AUTO_RESUME_LATEST="${AUTO_RESUME_LATEST:-1}"
+PHASE_A_RESUME_CHECKPOINT="${PHASE_A_RESUME_CHECKPOINT:-}"
+PHASE_B_RESUME_CHECKPOINT="${PHASE_B_RESUME_CHECKPOINT:-}"
+PHASE_C_RESUME_CHECKPOINT="${PHASE_C_RESUME_CHECKPOINT:-}"
 
 ANAPRIOR_OUTPUT_BASE="${ANAPRIOR_OUTPUT_BASE:-/mnt3/zhangran/anaprior_outputs}"
 RUN_NAME="${RUN_NAME:-afloc_mrsg_box_free_full}"
@@ -108,9 +113,6 @@ PHASE_C_REPORT="${PHASE_C_ROOT}/train_report.json"
 PHASE_A_BEST="${PHASE_A_ROOT}/mrsg_phase_a.pt"
 PHASE_B_BEST="${PHASE_B_ROOT}/mrsg_phase_b.pt"
 PHASE_C_BEST="${PHASE_C_ROOT}/mrsg_phase_c.pt"
-PHASE_A_LATEST="${PHASE_A_ROOT}/mrsg_phase_a_latest.pt"
-PHASE_B_LATEST="${PHASE_B_ROOT}/mrsg_phase_b_latest.pt"
-PHASE_C_LATEST="${PHASE_C_ROOT}/mrsg_phase_c_latest.pt"
 MSCXR_HMAPS="${MSCXR_EVAL_ROOT}/${METHOD_NAME}/hmaps.npy"
 MSCXR_SUMMARY_JSON="${MSCXR_EVAL_ROOT}/mrsg_eval_summary.json"
 MSCXR_CASE_DIAGNOSTICS_JSON="${MSCXR_EVAL_ROOT}/mrsg_case_diagnostics.json"
@@ -176,15 +178,6 @@ export W_QUERY
 PHASE_A_RESUME_ARGS=()
 PHASE_B_RESUME_ARGS=()
 PHASE_C_RESUME_ARGS=()
-if [[ "${AUTO_RESUME_LATEST}" == "1" && -f "${PHASE_A_LATEST}" ]]; then
-  PHASE_A_RESUME_ARGS=(--resume-checkpoint "${PHASE_A_LATEST}")
-fi
-if [[ "${AUTO_RESUME_LATEST}" == "1" && -f "${PHASE_B_LATEST}" ]]; then
-  PHASE_B_RESUME_ARGS=(--resume-checkpoint "${PHASE_B_LATEST}")
-fi
-if [[ "${AUTO_RESUME_LATEST}" == "1" && -f "${PHASE_C_LATEST}" ]]; then
-  PHASE_C_RESUME_ARGS=(--resume-checkpoint "${PHASE_C_LATEST}")
-fi
 
 MSCXR_EVAL_ARGS_JSON="$(python - <<'PY'
 import json
@@ -272,6 +265,25 @@ require_dir() {
     echo "[AFLoc-MRSG] ERROR: missing required directory for ${label}: ${path}" >&2
     exit 1
   fi
+}
+
+resolve_resume_checkpoint() {
+  local env_name="$1"
+  local phase_label="$2"
+  local checkpoint_path="$3"
+  local -n target_args_ref="$4"
+  target_args_ref=()
+
+  if [[ -z "${checkpoint_path}" ]]; then
+    echo "[AFLoc-MRSG] ${phase_label}: resume checkpoint disabled by default; same-phase rerun always starts from the passed upstream best checkpoint"
+    return 0
+  fi
+  if [[ ! -f "${checkpoint_path}" ]]; then
+    echo "[AFLoc-MRSG] ERROR: ${env_name} does not exist: ${checkpoint_path}" >&2
+    exit 1
+  fi
+  echo "[AFLoc-MRSG] ${phase_label}: Explicit same-phase resume only via ${env_name}=${checkpoint_path}"
+  target_args_ref=(--resume-checkpoint "${checkpoint_path}")
 }
 
 print_cmd() {
@@ -473,7 +485,9 @@ if manifest_path.exists():
     payload["output_hashes"] = dict(current.get("output_hashes", {}))
 
 manifest_path.parent.mkdir(parents=True, exist_ok=True)
-manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+tmp_path = manifest_path.with_name(f"{manifest_path.name}.tmp")
+tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+tmp_path.replace(manifest_path)
 PY
 }
 
@@ -487,6 +501,26 @@ validate_frozen_manifest() {
     exit 1
   fi
   write_frozen_manifest
+}
+
+guard_stage7_frozen_manifest() {
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "[AFLoc-MRSG] DRY_RUN would guard Stage 7 via ${FROZEN_MANIFEST}"
+    return 0
+  fi
+  python - "${FROZEN_MANIFEST}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+manifest_path = Path(sys.argv[1])
+if not manifest_path.exists():
+    raise SystemExit(f"missing frozen manifest: {manifest_path}")
+payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+if bool(payload.get("test_evaluated", False)):
+    raise SystemExit("test_evaluated already true; Stage 7 is one-shot and must not rerun")
+PY
 }
 
 update_frozen_manifest_outputs() {
@@ -540,7 +574,9 @@ immutable_after = {
 if immutable_before != immutable_after:
     raise SystemExit("frozen manifest update attempted to modify immutable experiment settings")
 
-manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+tmp_path = manifest_path.with_name(f"{manifest_path.name}.tmp")
+tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+tmp_path.replace(manifest_path)
 PY
 }
 
@@ -560,6 +596,7 @@ echo "[AFLoc-MRSG] DRY_RUN=${DRY_RUN}"
 echo "[AFLoc-MRSG] PREFLIGHT_ONLY=${PREFLIGHT_ONLY}"
 echo "[AFLoc-MRSG] AFLOC_HF_LOCAL_FILES_ONLY=${AFLOC_HF_LOCAL_FILES_ONLY}"
 echo "[AFLoc-MRSG] AFLOC_BERT_TYPE=${AFLOC_BERT_TYPE:-<checkpoint default>}"
+echo "[AFLoc-MRSG] same-phase resume is explicit-only; implicit latest-checkpoint discovery is disabled"
 
 if [[ ! "${START_STAGE}" =~ ^[0-9]+$ ]]; then
   echo "[AFLoc-MRSG] ERROR: START_STAGE must be an integer from 0 to 10" >&2
@@ -583,6 +620,9 @@ require_file "CHEXLOCALIZE_TEST_JSON" "${CHEXLOCALIZE_TEST_JSON}"
 require_dir "CHEXLOCALIZE_TEST_IMG_DIR" "${CHEXLOCALIZE_TEST_IMG_DIR}"
 require_file "REFERENCE_BASELINE_HMAP" "${REFERENCE_HMAPS_ROOT}/${BASELINE_METHOD}/hmaps.npy"
 require_file "REFERENCE_DCEM_HMAP" "${REFERENCE_HMAPS_ROOT}/${DCEM_METHOD}/hmaps.npy"
+resolve_resume_checkpoint "PHASE_A_RESUME_CHECKPOINT" "Phase A locality warm-up" "${PHASE_A_RESUME_CHECKPOINT}" PHASE_A_RESUME_ARGS
+resolve_resume_checkpoint "PHASE_B_RESUME_CHECKPOINT" "Phase B sparse grounding" "${PHASE_B_RESUME_CHECKPOINT}" PHASE_B_RESUME_ARGS
+resolve_resume_checkpoint "PHASE_C_RESUME_CHECKPOINT" "Phase C dual consistency" "${PHASE_C_RESUME_CHECKPOINT}" PHASE_C_RESUME_ARGS
 
 ensure_clean_outroot
 mkdir -p "${CACHE_ROOT}" "${PHASE_A_ROOT}" "${PHASE_B_ROOT}" "${PHASE_C_ROOT}" "${MSCXR_EVAL_ROOT}" "${SCORE_HMAP_ROOT}" "${METRIC_ROOT}" "${CHEXLOCALIZE_EVAL_ROOT}" "${BUNDLE_ROOT}"
@@ -756,6 +796,7 @@ fi
 # [7/10] raw MS-CXR heatmaps
 if stage_enabled 7; then
   validate_frozen_manifest
+  guard_stage7_frozen_manifest
   run_cmd 7 "raw MS-CXR heatmaps" \
     python -m anaprior.eval.eval_mscxr_afloc_mrsg \
     --dataset "MS_CXR" \
