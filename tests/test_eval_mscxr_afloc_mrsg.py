@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+from PIL import Image
 import pytest
 import torch
 
@@ -207,13 +209,24 @@ def test_default_encode_case_uses_afloc_process_img_contract(tmp_path: Path) -> 
         def __init__(self) -> None:
             self.afloc = FakeRuntimeAFLoc()
 
-        def __call__(self, images, phrases, disease_descriptions, device):
+        def __call__(self, images, phrases, disease_descriptions, device, image_gray=None):
             seen["images"] = images.detach().clone()
             seen["phrases"] = list(phrases)
             seen["descriptions"] = list(disease_descriptions)
             seen["encoder_device"] = device
+            seen["image_gray"] = None if image_gray is None else image_gray.detach().clone()
             return (
-                type("ImageFeatures", (), {"image_gray": images.mean(dim=1, keepdim=True)})(),
+                type(
+                    "ImageFeatures",
+                    (),
+                    {
+                        "image_gray": (
+                            images.mean(dim=1, keepdim=True)
+                            if image_gray is None
+                            else image_gray
+                        )
+                    },
+                )(),
                 object(),
             )
 
@@ -263,6 +276,7 @@ def test_default_encode_case_uses_afloc_process_img_contract(tmp_path: Path) -> 
     assert torch.equal(seen["images"], processed)
     assert seen["phrases"] == ["right pleural effusion"]
     assert seen["descriptions"] == ["Pleural Effusion"]
+    assert seen["image_gray"] is None
     assert result.case_diagnostics[0]["hmap_max"] == pytest.approx(1.0)
 
 
@@ -288,3 +302,87 @@ def test_default_encode_case_fails_clearly_without_afloc_process_img(tmp_path: P
             checkpoint_bundle,
             "cpu",
         )
+
+
+def test_default_encode_case_supplies_preprocessed_grayscale_override_when_cfg_is_available(
+    tmp_path: Path,
+) -> None:
+    ckpt = write_fake_mrsg_checkpoint(tmp_path)
+    image_path = tmp_path / "cfg-process-img.png"
+    Image.fromarray(np.arange(64, dtype=np.uint8).reshape(8, 8), mode="L").save(image_path)
+    processed = torch.full((1, 3, 8, 8), 0.25, dtype=torch.float32)
+    seen: dict[str, object] = {}
+
+    class FakeRuntimeAFLoc:
+        def __init__(self) -> None:
+            self.cfg = SimpleNamespace(
+                data=SimpleNamespace(image=SimpleNamespace(imsize=8)),
+                transforms=SimpleNamespace(center_crop=None, random_crop=None, norm="half"),
+            )
+
+        def process_img(self, paths, device, flag=0):
+            seen["paths"] = list(paths)
+            seen["device"] = device
+            seen["flag"] = flag
+            return processed.clone()
+
+    class FakeRuntimeEncoder:
+        def __init__(self) -> None:
+            self.afloc = FakeRuntimeAFLoc()
+
+        def __call__(self, images, phrases, disease_descriptions, device, image_gray=None):
+            seen["image_gray"] = None if image_gray is None else image_gray.detach().clone()
+            return (
+                type(
+                    "ImageFeatures",
+                    (),
+                    {
+                        "image_gray": (
+                            images.mean(dim=1, keepdim=True)
+                            if image_gray is None
+                            else image_gray
+                        )
+                    },
+                )(),
+                object(),
+            )
+
+    class FakeMRSGModel:
+        def __call__(self, image_features, phrase_features):
+            assert image_features.image_gray.shape == (1, 1, 8, 8)
+            assert float(image_features.image_gray.min()) >= 0.0
+            assert float(image_features.image_gray.max()) <= 1.0
+            heatmap = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]], dtype=torch.float32)
+            return type(
+                "Output",
+                (),
+                {
+                    "final_heatmap": heatmap,
+                    "query_route_weights": torch.tensor([[0.25, 0.25, 0.25, 0.25]], dtype=torch.float32),
+                    "query_reliability": torch.tensor([[0.4, 0.3, 0.2, 0.1]], dtype=torch.float32),
+                },
+            )()
+
+    checkpoint_bundle = {
+        "path": ckpt,
+        "reference": {"path": ckpt, "payload": {}},
+        "runtime": {
+            "afloc_encoder": FakeRuntimeEncoder(),
+            "mrsg_model": FakeMRSGModel(),
+        },
+        "afloc_checkpoint": tmp_path / "afloc.ckpt",
+    }
+
+    default_encode_case(
+        {
+            "path": str(image_path),
+            "label_text": "opacity",
+            "category": "Pneumonia",
+        },
+        checkpoint_bundle,
+        "cpu",
+    )
+
+    assert seen["paths"] == [str(image_path)]
+    assert seen["flag"] == 0
+    assert isinstance(seen["image_gray"], torch.Tensor)

@@ -88,7 +88,8 @@ def test_builds_candidate_region_rows_and_summary(tmp_path: Path) -> None:
     assert report["findings"]["Pneumothorax"]["positive_rows"] == 1
     assert report["findings"]["Pleural Effusion"]["positive_rows"] == 1
 
-    rows = list(csv.DictReader((outdir / "region_finding_train.csv").open(encoding="utf-8")))
+    with (outdir / "region_finding_train.csv").open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
     assert {
         (row["region"], row["finding"], row["label"])
         for row in rows
@@ -99,7 +100,8 @@ def test_builds_candidate_region_rows_and_summary(tmp_path: Path) -> None:
         ("left costophrenic angle", "Pleural Effusion", "1"),
     }
 
-    summary_rows = list(csv.DictReader((outdir / "region_finding_summary_train.csv").open(encoding="utf-8")))
+    with (outdir / "region_finding_summary_train.csv").open(encoding="utf-8") as handle:
+        summary_rows = list(csv.DictReader(handle))
     assert any(
         row["finding"] == "Pneumothorax"
         and row["region"] == "right lung"
@@ -187,7 +189,8 @@ def test_explicit_label_policy_drops_unmentioned_negatives(tmp_path: Path) -> No
     )
 
     assert report["rows"] == 1
-    rows = list(csv.DictReader((outdir / "region_finding_train.csv").open(encoding="utf-8")))
+    with (outdir / "region_finding_train.csv").open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
     assert rows[0]["region"] == "right lung"
     assert rows[0]["label"] == "1"
     assert rows[0]["label_source"] == "explicit_yes"
@@ -257,7 +260,8 @@ def test_builds_alias_and_namespace_labels_for_mscxr_eight_class_names(tmp_path:
     assert "anatomicalfinding|vascular congestion" in report["finding_attribute_sources"]["Edema"]
     assert "disease|pneumonia" in report["finding_attribute_sources"]["Pneumonia"]
 
-    rows = list(csv.DictReader((outdir / "region_finding_train.csv").open(encoding="utf-8")))
+    with (outdir / "region_finding_train.csv").open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
     positives = {
         (row["region"], row["finding"], row["raw_attributes"])
         for row in rows

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -71,6 +72,15 @@ def _tiny_model_config() -> MRSGConfig:
         topk_fraction=0.25,
         route_temperature=1.0,
     )
+
+
+class ConfiguredFakeAFLoc(FakeAFLoc):
+    def __init__(self, text_dim: int = 24) -> None:
+        super().__init__(text_dim=text_dim)
+        self.cfg = SimpleNamespace(
+            data=SimpleNamespace(image=SimpleNamespace(imsize=32)),
+            transforms=SimpleNamespace(center_crop=None, random_crop=None, norm="half"),
+        )
 
 
 def _load_checkpoint(path: Path) -> dict[str, object]:
@@ -220,6 +230,45 @@ def test_locality_phase_trains_only_pyramid_and_mask_predictor(tmp_path: Path) -
     assert _module_unchanged(initial_state, trained_state, "query_bank")
     assert _module_unchanged(initial_state, trained_state, "grounder")
     assert _module_unchanged(initial_state, trained_state, "decoder")
+
+
+def test_training_passes_afloc_preprocessing_contract_into_both_datasets(tmp_path: Path) -> None:
+    module = trainer_module()
+    train_manifest, valid_manifest, descriptions_json, protocol_manifest = _prepare_manifests(
+        tmp_path
+    )
+    seen: list[object] = []
+    original_dataset = module.MRSGDataset
+
+    class RecordingDataset(original_dataset):
+        def __init__(self, *args, **kwargs):
+            seen.append(kwargs.get("afloc_preprocessing"))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(module, "MRSGDataset", RecordingDataset)
+    try:
+        module.train_afloc_mrsg(
+            phase="locality",
+            train_manifest=train_manifest,
+            valid_manifest=valid_manifest,
+            outdir=tmp_path / "configured-preprocessing",
+            afloc_encoder=FrozenAFLocMRSGEncoder(ConfiguredFakeAFLoc()),
+            descriptions_json=descriptions_json,
+            protocol_manifest=protocol_manifest,
+            model_config=_tiny_model_config(),
+            epochs=1,
+            batch_size=2,
+            learning_rate=5.0e-3,
+            seed=13,
+            device="cpu",
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert len(seen) == 2
+    assert all(item is not None for item in seen)
+    assert all(tuple(item.output_size) == (32, 32) for item in seen)
 
 
 def test_locality_phase_preserves_failing_gate_diagnostics_without_override(tmp_path: Path) -> None:
@@ -965,3 +1014,25 @@ def test_cli_runs_tiny_locality_training_and_writes_report(
     payload = json.loads(captured.out)
     assert payload["phase"] == "locality"
     assert Path(payload["report"]).exists()
+
+
+def test_cli_requires_protocol_manifest(tmp_path: Path) -> None:
+    module = trainer_module()
+
+    with pytest.raises(SystemExit) as exc_info:
+        module.parse_args(
+            [
+                "--phase",
+                "locality",
+                "--train-manifest",
+                str(tmp_path / "train.jsonl"),
+                "--valid-manifest",
+                str(tmp_path / "valid.jsonl"),
+                "--outdir",
+                str(tmp_path / "out"),
+                "--afloc-checkpoint",
+                str(tmp_path / "afloc.ckpt"),
+            ]
+        )
+
+    assert exc_info.value.code == 2

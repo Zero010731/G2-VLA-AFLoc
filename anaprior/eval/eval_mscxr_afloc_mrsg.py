@@ -13,6 +13,10 @@ import numpy as np
 import pandas as pd
 import torch
 
+from anaprior.features.afloc_preprocessing import (
+    extract_afloc_image_preprocessing,
+    preprocess_afloc_image_from_path,
+)
 from anaprior.features.afloc_mrsg_encoder import FrozenAFLocMRSGEncoder
 from anaprior.models.afloc_mrsg import AFLocMRSG, MRSGConfig
 
@@ -213,6 +217,14 @@ def default_encode_case(
             "AFLoc runtime process_img must accept (paths, device, flag=0) for checkpoint-driven preprocessing."
         ) from exc
     tensor = tensor.to(torch.device(device))
+    image_gray = None
+    try:
+        preprocessing = extract_afloc_image_preprocessing(afloc_model)
+    except ValueError:
+        preprocessing = None
+    if preprocessing is not None:
+        _, image_gray_tensor = preprocess_afloc_image_from_path(row["path"], preprocessing)
+        image_gray = image_gray_tensor.unsqueeze(0).to(device=torch.device(device), dtype=tensor.dtype)
     phrase = str(row["label_text"])
     disease_description = str(row["category"]) or phrase
     with torch.no_grad():
@@ -221,6 +233,7 @@ def default_encode_case(
             [phrase],
             [disease_description],
             device=device,
+            image_gray=image_gray,
         )
         output = runtime["mrsg_model"](image_features, phrase_features)
     return {

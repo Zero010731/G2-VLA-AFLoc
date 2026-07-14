@@ -151,7 +151,8 @@ def write_region_table_with_missing_bbox(path: Path) -> None:
 def test_finding_vocab_is_deterministic(tmp_path: Path) -> None:
     table_path = tmp_path / "region_table.csv"
     write_region_table(table_path)
-    rows = list(csv.DictReader(table_path.open(encoding="utf-8")))
+    with table_path.open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
 
     assert finding_vocab_from_rows(rows) == {"Pleural Effusion": 0, "Pneumothorax": 1}
 

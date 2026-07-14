@@ -125,6 +125,16 @@ def test_encoder_train_cannot_switch_afloc_out_of_eval() -> None:
     assert not fake_afloc.training
 
 
+def test_encoder_uses_explicit_grayscale_override_when_provided() -> None:
+    encoder = FrozenAFLocMRSGEncoder(FakeAFLoc())
+    images = torch.zeros(1, 3, 6, 5, dtype=torch.float32)
+    image_gray = torch.linspace(0.0, 1.0, steps=30, dtype=torch.float32).view(1, 1, 6, 5)
+
+    features = encoder.encode_images(images, image_gray=image_gray)
+
+    assert torch.equal(features.image_gray, image_gray)
+
+
 def test_encoder_normalizes_word_token_layout_and_text_embeddings() -> None:
     encoded = FrozenAFLocMRSGEncoder(DeterministicFakeAFLoc()).encode_phrases(
         ["small right apical pneumothorax"],

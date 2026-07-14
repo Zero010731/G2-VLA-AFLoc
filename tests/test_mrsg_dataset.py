@@ -9,6 +9,10 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader
 
+from anaprior.features.afloc_preprocessing import (
+    AFLocImagePreprocessing,
+    preprocess_afloc_image_from_path,
+)
 from anaprior.models.afloc_mrsg.teacher import GeometryTransform
 
 
@@ -97,6 +101,65 @@ def test_dataset_returns_geometry_tracked_views_and_laterality_metadata(tmp_path
     assert sample["negative_phrases"] == ["small right pleural effusion"]
     assert sample["equivariance_phrase"] == "small left apical pneumothorax"
     assert sample["equivariance_negative_phrases"] == ["small right pleural effusion"]
+
+
+def test_afloc_preprocessing_matches_reference_resize_pad_center_crop_and_half_norm(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "rectangular.png"
+    height, width = 4, 8
+    pixels = np.arange(height * width, dtype=np.uint8).reshape(height, width)
+    Image.fromarray(pixels, mode="L").save(image_path)
+
+    preprocessing = AFLocImagePreprocessing(imsize=8, center_crop_size=(6, 6), norm="half")
+
+    processed, gray = preprocess_afloc_image_from_path(image_path, preprocessing)
+
+    reference = Image.fromarray(pixels, mode="L").resize((8, 4), Image.Resampling.BOX)
+    reference = np.pad(np.asarray(reference), ((2, 2), (0, 0)), mode="constant", constant_values=0)
+    rgb = Image.fromarray(reference).convert("RGB")
+    cropped = rgb.crop((1, 1, 7, 7))
+    cropped_rgb = torch.from_numpy(np.asarray(cropped, dtype=np.float32) / 255.0).permute(2, 0, 1)
+    reference_processed = (cropped_rgb - 0.5) / 0.5
+    reference_gray = torch.from_numpy(np.asarray(cropped.convert("L"), dtype=np.float32) / 255.0).unsqueeze(0)
+
+    assert torch.allclose(processed, reference_processed, atol=1.0e-6)
+    assert torch.allclose(gray, reference_gray, atol=1.0e-6)
+
+
+def test_dataset_afloc_preprocessing_preserves_geometry_for_rgb_and_grayscale(tmp_path: Path) -> None:
+    manifest = _write_manifest_and_image(tmp_path)
+    preprocessing = AFLocImagePreprocessing(imsize=6, center_crop_size=None, norm="half")
+    reference_rgb, reference_gray = preprocess_afloc_image_from_path(
+        json.loads(manifest.read_text(encoding="utf-8").strip())["image_path"],
+        preprocessing,
+    )
+
+    from anaprior.data.mrsg_dataset import MRSGDataset
+
+    dataset = MRSGDataset(
+        manifest_path=manifest,
+        image_size=(6, 6),
+        crop_size=(4, 4),
+        afloc_preprocessing=preprocessing,
+        seed=5,
+        geometry_prob=1.0,
+        horizontal_flip_prob=1.0,
+        weak_noise_std=0.0,
+        strong_noise_std=0.0,
+        equivariance_horizontal_flip_prob=0.0,
+    )
+
+    sample = dataset[0]
+    expected_rgb = reference_rgb[:, 0:4, 2:6].flip(-1)
+    expected_gray = reference_gray[:, 0:4, 2:6].flip(-1)
+
+    assert torch.allclose(sample["original_image"], reference_rgb, atol=1.0e-6)
+    assert torch.allclose(sample["original_image_gray"], reference_gray, atol=1.0e-6)
+    assert torch.allclose(sample["geometry_applied_image"], expected_rgb, atol=1.0e-6)
+    assert torch.allclose(sample["geometry_applied_gray"], expected_gray, atol=1.0e-6)
+    assert torch.allclose(sample["weak_image_gray"], expected_gray, atol=1.0e-6)
+    assert torch.allclose(sample["strong_image_gray"], expected_gray, atol=1.0e-6)
 
 
 def test_dataset_uses_shared_geometry_for_weak_and_strong_but_distinct_photometric_noise(

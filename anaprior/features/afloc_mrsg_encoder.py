@@ -36,17 +36,26 @@ class FrozenAFLocMRSGEncoder(nn.Module):
         self.afloc.eval()
         return self
 
-    def encode_images(self, images: torch.Tensor) -> AFLocFeatureBatch:
+    def encode_images(
+        self,
+        images: torch.Tensor,
+        *,
+        image_gray: torch.Tensor | None = None,
+    ) -> AFLocFeatureBatch:
         self.afloc.eval()
         with torch.no_grad():
             img_emb_l, img_emb_l2, img_emb_lf, _ = self.afloc.image_encoder_forward(images)
-            image_gray = images.mean(dim=1, keepdim=True)
+            resolved_image_gray = (
+                images.mean(dim=1, keepdim=True)
+                if image_gray is None
+                else self._normalize_image_gray(image_gray, images)
+            )
 
         return AFLocFeatureBatch(
             img_emb_l2=self._require_4d(img_emb_l2, "img_emb_l2"),
             img_emb_l=self._require_4d(img_emb_l, "img_emb_l"),
             img_emb_lf=self._require_4d(img_emb_lf, "img_emb_lf"),
-            image_gray=self._require_4d(image_gray, "image_gray"),
+            image_gray=self._require_4d(resolved_image_gray, "image_gray"),
         )
 
     def encode_phrases(
@@ -89,10 +98,11 @@ class FrozenAFLocMRSGEncoder(nn.Module):
         phrases: Sequence[str],
         disease_descriptions: Sequence[str],
         device: Union[str, torch.device, None] = None,
+        image_gray: torch.Tensor | None = None,
     ) -> tuple[AFLocFeatureBatch, PhraseFeatureBatch]:
         phrase_device = device if device is not None else images.device
         return (
-            self.encode_images(images),
+            self.encode_images(images, image_gray=image_gray),
             self.encode_phrases(phrases, disease_descriptions, device=phrase_device),
         )
 
@@ -140,3 +150,20 @@ class FrozenAFLocMRSGEncoder(nn.Module):
         if attention_mask.ndim != 2:
             raise ValueError("attention_mask must have shape [B,T]")
         return attention_mask.detach().to(dtype=torch.bool)
+
+    @classmethod
+    def _normalize_image_gray(
+        cls,
+        image_gray: torch.Tensor,
+        images: torch.Tensor,
+    ) -> torch.Tensor:
+        if image_gray.ndim == 3:
+            image_gray = image_gray.unsqueeze(0)
+        image_gray = cls._require_4d(image_gray, "image_gray")
+        if image_gray.shape[0] != images.shape[0]:
+            raise ValueError("image_gray must share the same batch size as images")
+        if image_gray.shape[1] != 1:
+            raise ValueError("image_gray must have a single grayscale channel")
+        if tuple(image_gray.shape[-2:]) != tuple(images.shape[-2:]):
+            raise ValueError("image_gray must match the image spatial size")
+        return image_gray

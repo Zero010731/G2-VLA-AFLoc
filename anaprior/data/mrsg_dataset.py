@@ -12,6 +12,10 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from anaprior.features.afloc_preprocessing import (
+    AFLocImagePreprocessing,
+    preprocess_afloc_image_from_path,
+)
 from anaprior.models.afloc_mrsg.teacher import GeometryTransform, transform_phrase
 
 
@@ -141,6 +145,7 @@ class MRSGDataset(Dataset[dict[str, Any]]):
         image_root: Path | str | None = None,
         image_size: tuple[int, int] = (224, 224),
         crop_size: tuple[int, int] | None = None,
+        afloc_preprocessing: AFLocImagePreprocessing | None = None,
         seed: int = 13,
         geometry_prob: float = 1.0,
         horizontal_flip_prob: float = 0.5,
@@ -151,7 +156,17 @@ class MRSGDataset(Dataset[dict[str, Any]]):
         self.manifest_path = Path(manifest_path)
         self.image_root = None if image_root is None else Path(image_root).resolve()
         self.rows = _load_manifest(self.manifest_path)
-        self.image_size = tuple(int(value) for value in image_size)
+        self.afloc_preprocessing = afloc_preprocessing
+        resolved_image_size = tuple(int(value) for value in image_size)
+        if self.afloc_preprocessing is not None:
+            preprocessing_size = tuple(int(value) for value in self.afloc_preprocessing.output_size)
+            if resolved_image_size != preprocessing_size:
+                raise ValueError(
+                    "image_size must match the AFLoc preprocessing output size when afloc_preprocessing is set"
+                )
+            self.image_size = preprocessing_size
+        else:
+            self.image_size = resolved_image_size
         self.crop_size = (
             tuple(int(value) for value in crop_size)
             if crop_size is not None
@@ -186,10 +201,12 @@ class MRSGDataset(Dataset[dict[str, Any]]):
                 ) from exc
         return resolved
 
-    def _load_image(self, image_path: str) -> torch.Tensor:
+    def _load_image(self, image_path: str) -> tuple[torch.Tensor, torch.Tensor]:
         path = self._resolve_image_path(image_path)
         if not path.exists():
             raise FileNotFoundError(f"missing image: {path}")
+        if self.afloc_preprocessing is not None:
+            return preprocess_afloc_image_from_path(path, self.afloc_preprocessing)
         try:
             with Image.open(path) as handle:
                 image = handle.convert("RGB").resize(
@@ -200,8 +217,12 @@ class MRSGDataset(Dataset[dict[str, Any]]):
             raise
         except Exception as exc:  # pragma: no cover - exercised in tests
             raise ValueError(f"Failed to load image: {path}") from exc
-        array = np.asarray(image, dtype=np.float32) / 255.0
-        return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+        rgb_array = np.asarray(image, dtype=np.float32) / 255.0
+        gray_array = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+        return (
+            torch.from_numpy(rgb_array).permute(2, 0, 1).contiguous(),
+            torch.from_numpy(gray_array).unsqueeze(0).contiguous(),
+        )
 
     def _geometry_transform(self, index: int) -> GeometryTransform:
         height, width = self.image_size
@@ -250,12 +271,14 @@ class MRSGDataset(Dataset[dict[str, Any]]):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.rows[index]
-        image = self._load_image(str(row["image_path"]))
+        image, image_gray = self._load_image(str(row["image_path"]))
         geometry = self._geometry_transform(index)
         equivariance_transform = self._equivariance_transform(index, geometry)
         relative_transform = relative_geometry_transform(geometry, equivariance_transform)
         geometry_applied = self._apply_geometry(image, geometry)
+        geometry_gray = self._apply_geometry(image_gray, geometry)
         equivariance_image = self._apply_geometry(image, equivariance_transform)
+        equivariance_gray = self._apply_geometry(image_gray, equivariance_transform)
         weak_image = _noise_like(
             geometry_applied,
             self.seed,
@@ -285,12 +308,17 @@ class MRSGDataset(Dataset[dict[str, Any]]):
 
         return {
             "original_image": image,
+            "original_image_gray": image_gray,
             "geometry_applied_image": geometry_applied,
+            "geometry_applied_gray": geometry_gray,
             "weak_geometry_image": geometry_applied.clone(),
             "strong_geometry_image": geometry_applied.clone(),
             "weak_image": weak_image,
+            "weak_image_gray": geometry_gray.clone(),
             "strong_image": strong_image,
+            "strong_image_gray": geometry_gray.clone(),
             "equivariance_image": equivariance_image,
+            "equivariance_image_gray": equivariance_gray,
             "geometry": geometry_metadata(geometry),
             "equivariance_transform": geometry_metadata(equivariance_transform),
             "relative_equivariance_transform": geometry_metadata(relative_transform),

@@ -81,7 +81,8 @@ def test_export_region_scores_writes_valid_rows_only(tmp_path: Path) -> None:
         valid_only=True,
     )
 
-    rows = list(csv.DictReader(out_csv.open(encoding="utf-8")))
+    with out_csv.open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
     assert report["rows_written"] == 1
     assert rows[0]["dicom_id"] == "dicom-a"
     assert rows[0]["finding"] == "Pneumothorax"
@@ -126,7 +127,8 @@ def test_export_region_scores_remaps_cache_vocab_and_skips_unsupported_findings(
         valid_only=True,
     )
 
-    rows = list(csv.DictReader(out_csv.open(encoding="utf-8")))
+    with out_csv.open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
     assert [row["finding"] for row in rows] == ["Pleural Effusion", "Pneumothorax"]
     assert [row["finding_id"] for row in rows] == ["0", "1"]
     assert report["rows_written"] == 2

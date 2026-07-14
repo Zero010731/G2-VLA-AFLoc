@@ -16,6 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from anaprior.data.mrsg_dataset import MRSGDataset
+from anaprior.features.afloc_preprocessing import extract_afloc_image_preprocessing
 from anaprior.features.afloc_mrsg_encoder import FrozenAFLocMRSGEncoder
 from anaprior.models.afloc_mrsg import AFLocMRSG, MRSGConfig
 from anaprior.models.afloc_mrsg.diagnostics import collect_mrsg_diagnostics, evaluate_phase_gate
@@ -141,7 +142,8 @@ def _infer_dimensions(
 ) -> tuple[tuple[int, int, int], int]:
     sample = dataset[0]
     strong = sample["strong_image"].unsqueeze(0).to(device)
-    image_features = afloc_encoder.encode_images(strong)
+    strong_gray = sample["strong_image_gray"].unsqueeze(0).to(device)
+    image_features = afloc_encoder.encode_images(strong, image_gray=strong_gray)
     phrase_features = afloc_encoder.encode_phrases(
         [sample["phrase"]],
         [sample["disease_description"]],
@@ -208,12 +210,17 @@ def _mrsg_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         return {}
     tensor_keys = (
         "original_image",
+        "original_image_gray",
         "geometry_applied_image",
+        "geometry_applied_gray",
         "weak_geometry_image",
         "strong_geometry_image",
         "weak_image",
+        "weak_image_gray",
         "strong_image",
+        "strong_image_gray",
         "equivariance_image",
+        "equivariance_image_gray",
     )
     string_keys = (
         "subject_id",
@@ -342,8 +349,10 @@ def _score_output(output) -> torch.Tensor:
 def _encode_batch_images(
     afloc_encoder: FrozenAFLocMRSGEncoder,
     images: torch.Tensor,
+    *,
+    image_gray: torch.Tensor | None = None,
 ) -> Any:
-    return afloc_encoder.encode_images(images)
+    return afloc_encoder.encode_images(images, image_gray=image_gray)
 
 
 def _encode_batch_phrases(
@@ -512,9 +521,16 @@ def _batch_forward_and_loss(
     teacher: MRSGTeacher | None,
 ) -> tuple[MRSGGroupedLoss, Any, torch.Tensor, torch.Tensor, torch.Tensor, TeacherTarget | None]:
     strong_images = batch["strong_image"].to(device)
+    strong_image_gray = batch["strong_image_gray"].to(device)
     weak_images = batch["weak_image"].to(device)
+    weak_image_gray = batch["weak_image_gray"].to(device)
     equiv_images = batch["equivariance_image"].to(device)
-    image_features = _encode_batch_images(afloc_encoder, strong_images)
+    equiv_image_gray = batch["equivariance_image_gray"].to(device)
+    image_features = _encode_batch_images(
+        afloc_encoder,
+        strong_images,
+        image_gray=strong_image_gray,
+    )
     phrase_features = _encode_batch_phrases(
         afloc_encoder,
         batch["phrase"],
@@ -549,14 +565,22 @@ def _batch_forward_and_loss(
     student_for_teacher = output
     if phase == "consistency":
         assert teacher is not None
-        weak_features = _encode_batch_images(afloc_encoder, weak_images)
+        weak_features = _encode_batch_images(
+            afloc_encoder,
+            weak_images,
+            image_gray=weak_image_gray,
+        )
         weak_phrases = _encode_batch_phrases(
             afloc_encoder,
             batch["phrase"],
             batch["disease_description"],
             device=device,
         )
-        equiv_features = _encode_batch_images(afloc_encoder, equiv_images)
+        equiv_features = _encode_batch_images(
+            afloc_encoder,
+            equiv_images,
+            image_gray=equiv_image_gray,
+        )
         equiv_phrases = _encode_batch_phrases(
             afloc_encoder,
             batch["equivariance_phrase"],
@@ -1008,8 +1032,25 @@ def train_afloc_mrsg(
     torch_device = torch.device(device)
     protocol_facts = _validate_protocol_manifest(protocol_path)
 
-    train_dataset = MRSGDataset(manifest_path=train_manifest, image_root=image_root)
-    valid_dataset = MRSGDataset(manifest_path=valid_manifest, image_root=image_root)
+    try:
+        afloc_preprocessing = extract_afloc_image_preprocessing(afloc_encoder.afloc)
+    except ValueError:
+        afloc_preprocessing = None
+    dataset_kwargs = {
+        "image_root": image_root,
+        "afloc_preprocessing": afloc_preprocessing,
+    }
+    if afloc_preprocessing is not None:
+        dataset_kwargs["image_size"] = tuple(int(value) for value in afloc_preprocessing.output_size)
+
+    train_dataset = MRSGDataset(
+        manifest_path=train_manifest,
+        **dataset_kwargs,
+    )
+    valid_dataset = MRSGDataset(
+        manifest_path=valid_manifest,
+        **dataset_kwargs,
+    )
     if len(train_dataset) == 0:
         raise ValueError("no training rows found in train_manifest")
     if len(valid_dataset) == 0:
@@ -1256,7 +1297,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--valid-manifest", required=True, type=Path)
     parser.add_argument("--outdir", required=True, type=Path)
     parser.add_argument("--afloc-checkpoint", required=True, type=Path)
-    parser.add_argument("--protocol-manifest", type=Path)
+    parser.add_argument("--protocol-manifest", required=True, type=Path)
     parser.add_argument("--descriptions-json", type=Path)
     parser.add_argument("--previous-checkpoint", type=Path)
     parser.add_argument("--resume-checkpoint", type=Path)
