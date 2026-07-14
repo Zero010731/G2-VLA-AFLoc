@@ -5,6 +5,7 @@ from typing import Sequence, Union
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from anaprior.models.afloc_mrsg.contracts import AFLocFeatureBatch, PhraseFeatureBatch
 
@@ -45,6 +46,9 @@ class FrozenAFLocMRSGEncoder(nn.Module):
         self.afloc.eval()
         with torch.no_grad():
             img_emb_l, img_emb_l2, img_emb_lf, _ = self.afloc.image_encoder_forward(images)
+            img_emb_l = self._require_4d(img_emb_l, "img_emb_l")
+            img_emb_l2 = self._require_4d(img_emb_l2, "img_emb_l2")
+            img_emb_lf = self._resolve_final_scale(img_emb_l, img_emb_lf)
             resolved_image_gray = (
                 images.mean(dim=1, keepdim=True)
                 if image_gray is None
@@ -52,9 +56,9 @@ class FrozenAFLocMRSGEncoder(nn.Module):
             )
 
         return AFLocFeatureBatch(
-            img_emb_l2=self._require_4d(img_emb_l2, "img_emb_l2"),
-            img_emb_l=self._require_4d(img_emb_l, "img_emb_l"),
-            img_emb_lf=self._require_4d(img_emb_lf, "img_emb_lf"),
+            img_emb_l2=img_emb_l2,
+            img_emb_l=img_emb_l,
+            img_emb_lf=img_emb_lf,
             image_gray=self._require_4d(resolved_image_gray, "image_gray"),
         )
 
@@ -120,6 +124,18 @@ class FrozenAFLocMRSGEncoder(nn.Module):
         if tensor.ndim != 4:
             raise ValueError(f"{name} must have shape [B,C,H,W]")
         return tensor.detach()
+
+    @classmethod
+    def _resolve_final_scale(
+        cls,
+        img_emb_l: torch.Tensor,
+        img_emb_lf: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if img_emb_lf is not None:
+            return cls._require_4d(img_emb_lf, "img_emb_lf")
+        height, width = img_emb_l.shape[-2:]
+        coarse_size = (max(1, (height + 1) // 2), max(1, (width + 1) // 2))
+        return F.adaptive_avg_pool2d(img_emb_l, coarse_size).detach()
 
     @staticmethod
     def _require_token_batch(tensor: torch.Tensor, name: str) -> torch.Tensor:

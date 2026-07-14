@@ -74,6 +74,12 @@ class BadWordShapeAFLoc(FakeAFLoc):
         }
 
 
+class MissingFinalEmbeddingAFLoc(FakeAFLoc):
+    def image_encoder_forward(self, images: torch.Tensor):
+        img_emb_l, img_emb_l2, _, img_emb_g = super().image_encoder_forward(images)
+        return img_emb_l, img_emb_l2, None, img_emb_g
+
+
 def test_encoder_freezes_afloc_and_returns_all_feature_levels() -> None:
     fake_afloc = FakeAFLoc()
     encoder = FrozenAFLocMRSGEncoder(fake_afloc)
@@ -114,6 +120,19 @@ def test_encoder_outputs_are_detached_and_backbone_gets_no_gradients() -> None:
     assert not phrase_features.disease_description_embedding.requires_grad
     assert not phrase_features.attention_mask.requires_grad
     assert all(parameter.grad is None for parameter in fake_afloc.parameters())
+
+
+def test_encoder_builds_coarse_level_when_afloc_final_embedding_is_none() -> None:
+    encoder = FrozenAFLocMRSGEncoder(MissingFinalEmbeddingAFLoc())
+
+    features = encoder.encode_images(torch.rand(2, 3, 224, 224))
+
+    assert features.img_emb_l.shape == (2, 64, 8, 8)
+    assert features.img_emb_lf.shape == (2, 64, 4, 4)
+    assert torch.equal(
+        features.img_emb_lf,
+        torch.nn.functional.adaptive_avg_pool2d(features.img_emb_l, (4, 4)),
+    )
 
 
 def test_encoder_train_cannot_switch_afloc_out_of_eval() -> None:
