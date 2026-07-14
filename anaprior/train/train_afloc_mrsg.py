@@ -752,6 +752,59 @@ def _concat_optional_tensor_dict(values: list[dict[str, torch.Tensor] | None]) -
     return _concat_tensor_dict(present)
 
 
+DIAGNOSTIC_SAMPLE_LIMIT = 256
+
+
+def _cpu_slice(tensor: torch.Tensor, limit: int) -> torch.Tensor:
+    return tensor[:limit].detach().cpu()
+
+
+def _cpu_slice_optional_tensor_dict(
+    values: dict[str, torch.Tensor] | None,
+    limit: int,
+) -> dict[str, torch.Tensor] | None:
+    if values is None:
+        return None
+    return {key: _cpu_slice(value, limit) for key, value in values.items()}
+
+
+def _diagnostic_output_snapshot(output: Any, limit: int) -> Any:
+    return type(output)(
+        final_heatmap=_cpu_slice(output.final_heatmap, limit),
+        query_heatmaps=_cpu_slice(output.query_heatmaps, limit),
+        query_route_weights=_cpu_slice(output.query_route_weights, limit),
+        query_reliability=_cpu_slice(output.query_reliability, limit),
+        phrase_patch_logits=_cpu_slice(output.phrase_patch_logits, limit),
+        masked_predictions=_cpu_slice_optional_tensor_dict(output.masked_predictions, limit),
+        source_targets=_cpu_slice_optional_tensor_dict(output.source_targets, limit),
+        patch_mask=None if output.patch_mask is None else _cpu_slice(output.patch_mask, limit),
+        query_reconstructed_phrase=(
+            None
+            if output.query_reconstructed_phrase is None
+            else _cpu_slice(output.query_reconstructed_phrase, limit)
+        ),
+        query_patch_gates=(
+            None
+            if output.query_patch_gates is None
+            else _cpu_slice(output.query_patch_gates, limit)
+        ),
+    )
+
+
+def _diagnostic_teacher_snapshot(
+    target: TeacherTarget | None,
+    limit: int,
+) -> TeacherTarget | None:
+    if target is None:
+        return None
+    return TeacherTarget(
+        final_heatmap=_cpu_slice(target.final_heatmap, limit),
+        query_heatmaps=_cpu_slice(target.query_heatmaps, limit),
+        confidence=_cpu_slice(target.confidence, limit),
+        route_weights=_cpu_slice(target.route_weights, limit),
+    )
+
+
 def _concat_mrsg_outputs(outputs: list[Any]) -> Any:
     first = outputs[0]
     return type(first)(
@@ -887,6 +940,7 @@ def _run_epoch(
     negative_batches = []
     negative_mask_batches = []
     teacher_target_batches = []
+    diagnostic_examples = 0
 
     for step, raw_batch in enumerate(loader):
         batch = raw_batch
@@ -918,16 +972,22 @@ def _run_epoch(
         totals["teacher"].append(float(loss.teacher.detach().cpu().item()))
         totals["mask"].append(float(loss.mask.detach().cpu().item()))
         totals["query"].append(float(loss.query.detach().cpu().item()))
-        last_output = output
-        last_positive = positive_scores.detach()
-        last_negative = negative_scores.detach()
-        last_negative_mask = negative_mask.detach()
-        last_teacher_target = teacher_target
-        output_batches.append(output)
-        positive_batches.append(positive_scores.detach())
-        negative_batches.append(negative_scores.detach())
-        negative_mask_batches.append(negative_mask.detach())
-        teacher_target_batches.append(teacher_target)
+        last_output = _diagnostic_output_snapshot(output, limit=1)
+        last_positive = _cpu_slice(positive_scores, 1)
+        last_negative = _cpu_slice(negative_scores, 1)
+        last_negative_mask = _cpu_slice(negative_mask, 1)
+        last_teacher_target = _diagnostic_teacher_snapshot(teacher_target, limit=1)
+        remaining = DIAGNOSTIC_SAMPLE_LIMIT - diagnostic_examples
+        if remaining > 0:
+            sample_count = min(int(positive_scores.shape[0]), remaining)
+            output_batches.append(_diagnostic_output_snapshot(output, limit=sample_count))
+            positive_batches.append(_cpu_slice(positive_scores, sample_count))
+            negative_batches.append(_cpu_slice(negative_scores, sample_count))
+            negative_mask_batches.append(_cpu_slice(negative_mask, sample_count))
+            teacher_target_batches.append(
+                _diagnostic_teacher_snapshot(teacher_target, limit=sample_count)
+            )
+            diagnostic_examples += sample_count
         for finding in batch["finding"]:
             entry = per_finding.setdefault(str(finding), {"count": 0.0})
             entry["count"] += 1.0

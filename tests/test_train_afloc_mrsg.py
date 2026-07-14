@@ -816,6 +816,25 @@ def test_validation_diagnostics_use_all_validation_batches_not_last_batch(tmp_pa
         monkeypatch.undo()
 
 
+def test_diagnostic_snapshot_is_bounded_detached_and_moved_to_cpu() -> None:
+    module = trainer_module()
+    output = _epoch_output(
+        batch_size=3,
+        positive_scores=torch.tensor([0.3, 0.4, 0.5]),
+        negative_scores=torch.tensor([[0.1], [0.2], [0.3]]),
+    )
+    output.final_heatmap.requires_grad_(True)
+
+    snapshot = module._diagnostic_output_snapshot(output, limit=2)
+
+    assert snapshot.final_heatmap.shape[0] == 2
+    assert snapshot.final_heatmap.device.type == "cpu"
+    assert not snapshot.final_heatmap.requires_grad
+    assert snapshot.query_heatmaps.shape[0] == 2
+    assert snapshot.masked_predictions is not None
+    assert all(tensor.device.type == "cpu" for tensor in snapshot.masked_predictions.values())
+
+
 def test_training_requires_valid_protocol_manifest_and_rejects_malicious_payload(tmp_path: Path) -> None:
     module = trainer_module()
     train_manifest, valid_manifest, descriptions_json, protocol_manifest = _prepare_manifests(
