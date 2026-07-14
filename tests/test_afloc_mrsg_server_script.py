@@ -334,6 +334,16 @@ def test_mrsg_runner_treats_chexlocalize_as_opt_in_external_evaluation() -> None
     assert 'CheXlocalize external evaluation disabled (RUN_CHEXLOCALIZE=0)' in script
 
 
+def test_mrsg_runner_uses_explicit_python39_runtime() -> None:
+    script = _script()
+
+    assert 'PYTHON_BIN="${PYTHON_BIN:-python}"' in script
+    assert 'Python 3.9 or newer is required' in script
+    assert '"${PYTHON_BIN}" -m anaprior.train.build_mrsg_image_report_cache' in script
+    assert '"${PYTHON_BIN}" -m anaprior.train.train_afloc_mrsg' in script
+    assert '"${PYTHON_BIN}" -m anaprior.eval.eval_mscxr_afloc_mrsg' in script
+
+
 def test_mrsg_runner_passes_bash_n_when_available() -> None:
     bash = shutil.which("bash")
     if bash is None:

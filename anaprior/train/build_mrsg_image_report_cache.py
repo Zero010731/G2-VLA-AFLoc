@@ -31,7 +31,10 @@ def _looks_like_json(text: str) -> bool:
 
 def _decode_structured_value(value: Any) -> Any:
     if isinstance(value, str) and _looks_like_json(value):
-        return json.loads(value)
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
     return value
 
 

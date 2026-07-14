@@ -94,6 +94,19 @@ def test_manifest_builder_rejects_recursive_forbidden_spatial_keys(tmp_path: Pat
         )
 
 
+def test_spatial_audit_treats_bracketed_report_text_as_plain_text() -> None:
+    from anaprior.train.build_mrsg_image_report_cache import (
+        _assert_no_forbidden_spatial_fields,
+    )
+
+    _assert_no_forbidden_spatial_fields(
+        {
+            "phrase": "[** deidentified date **] right basilar opacity",
+            "negative_phrases": ["{not JSON} no pleural effusion"],
+        }
+    )
+
+
 def test_manifest_builder_skips_negated_and_uncertain_phrases(tmp_path: Path) -> None:
     from anaprior.train.build_mrsg_image_report_cache import build_mrsg_image_report_cache
 

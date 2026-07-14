@@ -28,6 +28,7 @@ Server-side environment variables or files:
 
 Important runtime knobs:
 
+- `PYTHON_BIN`: Python 3.9+ interpreter used for every stage; set it to the AFLoc environment interpreter when running under `nohup`.
 - `OUTROOT`: experiment root.
 - `RUN_NAME`: names the experiment subdirectory.
 - `START_STAGE`: integer `0..10`.

@@ -19,6 +19,12 @@ set -euo pipefail
 #   DRY_RUN=1 bash scripts/run_afloc_mrsg_full_server.sh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
+if ! "${PYTHON_BIN}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)'; then
+  echo "[AFLoc-MRSG] ERROR: Python 3.9 or newer is required: ${PYTHON_BIN}" >&2
+  exit 1
+fi
 
 export AFLOC_TMPDIR="${AFLOC_TMPDIR:-/mnt3/zhangran/tmp}"
 export TMPDIR="${AFLOC_TMPDIR}"
@@ -185,7 +191,7 @@ PHASE_A_RESUME_ARGS=()
 PHASE_B_RESUME_ARGS=()
 PHASE_C_RESUME_ARGS=()
 
-MSCXR_EVAL_ARGS_JSON="$(python - <<'PY'
+MSCXR_EVAL_ARGS_JSON="$("${PYTHON_BIN}" - <<'PY'
 import json
 import os
 
@@ -203,7 +209,7 @@ print(json.dumps(payload, sort_keys=True))
 PY
 )"
 
-CHEXLOCALIZE_EVAL_ARGS_JSON="$(python - <<'PY'
+CHEXLOCALIZE_EVAL_ARGS_JSON="$("${PYTHON_BIN}" - <<'PY'
 import json
 import os
 
@@ -221,7 +227,7 @@ print(json.dumps(payload, sort_keys=True))
 PY
 )"
 
-SCORE_ARGS_JSON="$(python - <<'PY'
+SCORE_ARGS_JSON="$("${PYTHON_BIN}" - <<'PY'
 import json
 import os
 
@@ -340,7 +346,7 @@ check_phase_gate_report() {
     echo "[AFLoc-MRSG] DRY_RUN would verify ${expected_phase} gate via ${report_path}"
     return 0
   fi
-  python - "${report_path}" "${expected_phase}" "${expected_checkpoint}" <<'PY'
+  "${PYTHON_BIN}" - "${report_path}" "${expected_phase}" "${expected_checkpoint}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -372,7 +378,7 @@ write_frozen_manifest() {
     echo "[AFLoc-MRSG] DRY_RUN would write ${FROZEN_MANIFEST}"
     return 0
   fi
-  python - "${FROZEN_MANIFEST}" "${CACHE_REPORT}" "${PROTOCOL_MANIFEST}" "${PHASE_A_REPORT}" "${PHASE_B_REPORT}" "${PHASE_C_REPORT}" "${AFLOC_CHECKPOINT}" <<'PY'
+  "${PYTHON_BIN}" - "${FROZEN_MANIFEST}" "${CACHE_REPORT}" "${PROTOCOL_MANIFEST}" "${PHASE_A_REPORT}" "${PHASE_B_REPORT}" "${PHASE_C_REPORT}" "${AFLOC_CHECKPOINT}" <<'PY'
 import hashlib
 import json
 import os
@@ -514,7 +520,7 @@ guard_stage7_frozen_manifest() {
     echo "[AFLoc-MRSG] DRY_RUN would guard Stage 7 via ${FROZEN_MANIFEST}"
     return 0
   fi
-  python - "${FROZEN_MANIFEST}" <<'PY'
+  "${PYTHON_BIN}" - "${FROZEN_MANIFEST}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -534,7 +540,7 @@ update_frozen_manifest_outputs() {
     echo "[AFLoc-MRSG] DRY_RUN would update output hashes in ${FROZEN_MANIFEST}"
     return 0
   fi
-  python - "${FROZEN_MANIFEST}" "$@" <<'PY'
+  "${PYTHON_BIN}" - "${FROZEN_MANIFEST}" "$@" <<'PY'
 import hashlib
 import json
 import sys
@@ -652,7 +658,7 @@ fi
 # [0/10] protocol manifest and MS-CXR exclusion audit
 if stage_enabled 0; then
   run_cmd 0 "protocol manifest and MS-CXR exclusion audit" \
-    python -m anaprior.train.build_mrsg_image_report_cache \
+    "${PYTHON_BIN}" -m anaprior.train.build_mrsg_image_report_cache \
     --mimic-csv "${MIMIC_CSV}" \
     --mscxr-json "${MSCXR_EXCLUSION_JSON}" \
     --descriptions-json "${DESCRIPTIONS_JSON}" \
@@ -660,7 +666,7 @@ if stage_enabled 0; then
     --valid-fraction "${VALID_FRACTION}" \
     --seed "${SEED}"
   if [[ "${DRY_RUN}" != "1" ]]; then
-    python - "${CACHE_REPORT}" "${PROTOCOL_MANIFEST}" <<'PY'
+    "${PYTHON_BIN}" - "${CACHE_REPORT}" "${PROTOCOL_MANIFEST}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -685,7 +691,7 @@ fi
 # [1/10] Phase A locality warm-up
 if stage_enabled 1; then
   run_cmd 1 "Phase A locality warm-up" \
-    python -m anaprior.train.train_afloc_mrsg \
+    "${PYTHON_BIN}" -m anaprior.train.train_afloc_mrsg \
     --phase "locality" \
     --train-manifest "${TRAIN_MANIFEST}" \
     --valid-manifest "${VALID_MANIFEST}" \
@@ -725,7 +731,7 @@ fi
 # [3/10] Phase B sparse grounding
 if stage_enabled 3; then
   run_cmd 3 "Phase B sparse grounding" \
-    python -m anaprior.train.train_afloc_mrsg \
+    "${PYTHON_BIN}" -m anaprior.train.train_afloc_mrsg \
     --phase "grounding" \
     --train-manifest "${TRAIN_MANIFEST}" \
     --valid-manifest "${VALID_MANIFEST}" \
@@ -766,7 +772,7 @@ fi
 # [5/10] Phase C dual consistency
 if stage_enabled 5; then
   run_cmd 5 "Phase C dual consistency" \
-    python -m anaprior.train.train_afloc_mrsg \
+    "${PYTHON_BIN}" -m anaprior.train.train_afloc_mrsg \
     --phase "consistency" \
     --train-manifest "${TRAIN_MANIFEST}" \
     --valid-manifest "${VALID_MANIFEST}" \
@@ -811,7 +817,7 @@ if stage_enabled 7; then
   validate_frozen_manifest
   guard_stage7_frozen_manifest
   run_cmd 7 "raw MS-CXR heatmaps" \
-    python -m anaprior.eval.eval_mscxr_afloc_mrsg \
+    "${PYTHON_BIN}" -m anaprior.eval.eval_mscxr_afloc_mrsg \
     --dataset "MS_CXR" \
     --split "test" \
     --afloc-checkpoint "${AFLOC_CHECKPOINT}" \
@@ -836,7 +842,7 @@ if stage_enabled 8; then
   install_reference_hmap "${BASELINE_METHOD}"
   install_reference_hmap "${DCEM_METHOD}"
   run_cmd 8 "raw scoring against AFLoc/DCEM baselines" \
-    python -m anaprior.eval.score_mscxr_learned_repair_metrics \
+    "${PYTHON_BIN}" -m anaprior.eval.score_mscxr_learned_repair_metrics \
     --hmaps-root "${SCORE_HMAP_ROOT}" \
     --outdir "${METRIC_ROOT}" \
     --methods "${SCORE_METHODS}" \
@@ -860,7 +866,7 @@ fi
 if [[ "${RUN_CHEXLOCALIZE}" == "1" ]] && stage_enabled 9; then
   validate_frozen_manifest
   run_cmd 9 "frozen CheXlocalize external evaluation" \
-    python -m anaprior.eval.eval_mscxr_afloc_mrsg \
+    "${PYTHON_BIN}" -m anaprior.eval.eval_mscxr_afloc_mrsg \
     --dataset "CHEXLOCALIZE" \
     --split "test" \
     --afloc-checkpoint "${AFLOC_CHECKPOINT}" \
@@ -881,11 +887,11 @@ fi
 if stage_enabled 10; then
   validate_frozen_manifest
   run_cmd 10 "report and diagnostics bundle" \
-    python -m anaprior.eval.report_stage_c_results \
+    "${PYTHON_BIN}" -m anaprior.eval.report_stage_c_results \
     --metrics-dir "${METRIC_ROOT}" \
     --output-md "${REPORT_MD}"
   if [[ "${DRY_RUN}" != "1" ]]; then
-    python - "${BUNDLE_JSON}" "${REPORT_MD}" "${FROZEN_MANIFEST}" "${CACHE_REPORT}" "${PHASE_A_REPORT}" "${PHASE_B_REPORT}" "${PHASE_C_REPORT}" "${MSCXR_SUMMARY_JSON}" "${METRIC_SUMMARY_JSON}" "${CHEXLOCALIZE_BUNDLE_ARGS[@]}" <<'PY'
+    "${PYTHON_BIN}" - "${BUNDLE_JSON}" "${REPORT_MD}" "${FROZEN_MANIFEST}" "${CACHE_REPORT}" "${PHASE_A_REPORT}" "${PHASE_B_REPORT}" "${PHASE_C_REPORT}" "${MSCXR_SUMMARY_JSON}" "${METRIC_SUMMARY_JSON}" "${CHEXLOCALIZE_BUNDLE_ARGS[@]}" <<'PY'
 import hashlib
 import json
 import sys
