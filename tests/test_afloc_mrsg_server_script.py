@@ -322,6 +322,18 @@ def test_mrsg_runner_scores_against_afloc_and_dcem_references() -> None:
     assert '--split "test"' in script
 
 
+def test_mrsg_runner_treats_chexlocalize_as_opt_in_external_evaluation() -> None:
+    script = _script()
+
+    assert 'RUN_CHEXLOCALIZE="${RUN_CHEXLOCALIZE:-0}"' in script
+    assert 'if [[ "${RUN_CHEXLOCALIZE}" == "1" ]]; then\n  require_file "CHEXLOCALIZE_TEST_JSON"' in script
+    assert 'if [[ "${RUN_CHEXLOCALIZE}" == "1" ]] && stage_enabled 9; then' in script
+    assert 'CHEXLOCALIZE_BUNDLE_ARGS=()' in script
+    assert 'CHEXLOCALIZE_BUNDLE_ARGS=("${CHEXLOCALIZE_SUMMARY_JSON}")' in script
+    assert '"${CHEXLOCALIZE_BUNDLE_ARGS[@]}" <<\'PY\'' in script
+    assert 'CheXlocalize external evaluation disabled (RUN_CHEXLOCALIZE=0)' in script
+
+
 def test_mrsg_runner_passes_bash_n_when_available() -> None:
     bash = shutil.which("bash")
     if bash is None:

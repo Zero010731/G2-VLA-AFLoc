@@ -34,6 +34,7 @@ START_STAGE="${START_STAGE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 ALLOW_DIRTY_OUTROOT="${ALLOW_DIRTY_OUTROOT:-0}"
+RUN_CHEXLOCALIZE="${RUN_CHEXLOCALIZE:-0}"
 PHASE_A_RESUME_CHECKPOINT="${PHASE_A_RESUME_CHECKPOINT:-}"
 PHASE_B_RESUME_CHECKPOINT="${PHASE_B_RESUME_CHECKPOINT:-}"
 PHASE_C_RESUME_CHECKPOINT="${PHASE_C_RESUME_CHECKPOINT:-}"
@@ -121,6 +122,11 @@ METRIC_DECISION_JSON="${METRIC_ROOT}/learned_repair_decision.json"
 CHEXLOCALIZE_HMAPS="${CHEXLOCALIZE_EVAL_ROOT}/${METHOD_NAME}/hmaps.npy"
 CHEXLOCALIZE_SUMMARY_JSON="${CHEXLOCALIZE_EVAL_ROOT}/mrsg_eval_summary.json"
 CHEXLOCALIZE_CASE_DIAGNOSTICS_JSON="${CHEXLOCALIZE_EVAL_ROOT}/mrsg_case_diagnostics.json"
+
+CHEXLOCALIZE_BUNDLE_ARGS=()
+if [[ "${RUN_CHEXLOCALIZE}" == "1" ]]; then
+  CHEXLOCALIZE_BUNDLE_ARGS=("${CHEXLOCALIZE_SUMMARY_JSON}")
+fi
 
 MAX_CASES_ARGS=()
 MAX_CASES_JSON="null"
@@ -594,6 +600,7 @@ echo "[AFLoc-MRSG] output root: ${OUTROOT}"
 echo "[AFLoc-MRSG] START_STAGE=${START_STAGE}"
 echo "[AFLoc-MRSG] DRY_RUN=${DRY_RUN}"
 echo "[AFLoc-MRSG] PREFLIGHT_ONLY=${PREFLIGHT_ONLY}"
+echo "[AFLoc-MRSG] RUN_CHEXLOCALIZE=${RUN_CHEXLOCALIZE}"
 echo "[AFLoc-MRSG] AFLOC_HF_LOCAL_FILES_ONLY=${AFLOC_HF_LOCAL_FILES_ONLY}"
 echo "[AFLoc-MRSG] AFLOC_BERT_TYPE=${AFLOC_BERT_TYPE:-<checkpoint default>}"
 echo "[AFLoc-MRSG] same-phase resume is explicit-only; implicit latest-checkpoint discovery is disabled"
@@ -606,6 +613,10 @@ if (( START_STAGE < 0 || START_STAGE > 10 )); then
   echo "[AFLoc-MRSG] ERROR: START_STAGE must be between 0 and 10" >&2
   exit 1
 fi
+if [[ "${RUN_CHEXLOCALIZE}" != "0" && "${RUN_CHEXLOCALIZE}" != "1" ]]; then
+  echo "[AFLoc-MRSG] ERROR: RUN_CHEXLOCALIZE must be 0 or 1" >&2
+  exit 1
+fi
 
 require_nonempty_env "MIMIC_CSV" "${MIMIC_CSV}"
 require_file "MIMIC_CSV" "${MIMIC_CSV}"
@@ -616,8 +627,10 @@ require_file "DESCRIPTIONS_JSON" "${DESCRIPTIONS_JSON}"
 require_dir "REFERENCE_HMAPS_ROOT" "${REFERENCE_HMAPS_ROOT}"
 require_file "LOCALIZATION_MS_CXR_JSON" "${LOCALIZATION_MS_CXR_JSON}"
 require_dir "LOCALIZATION_MIMIC_IMG_DIR" "${LOCALIZATION_MIMIC_IMG_DIR}"
-require_file "CHEXLOCALIZE_TEST_JSON" "${CHEXLOCALIZE_TEST_JSON}"
-require_dir "CHEXLOCALIZE_TEST_IMG_DIR" "${CHEXLOCALIZE_TEST_IMG_DIR}"
+if [[ "${RUN_CHEXLOCALIZE}" == "1" ]]; then
+  require_file "CHEXLOCALIZE_TEST_JSON" "${CHEXLOCALIZE_TEST_JSON}"
+  require_dir "CHEXLOCALIZE_TEST_IMG_DIR" "${CHEXLOCALIZE_TEST_IMG_DIR}"
+fi
 require_file "REFERENCE_BASELINE_HMAP" "${REFERENCE_HMAPS_ROOT}/${BASELINE_METHOD}/hmaps.npy"
 require_file "REFERENCE_DCEM_HMAP" "${REFERENCE_HMAPS_ROOT}/${DCEM_METHOD}/hmaps.npy"
 resolve_resume_checkpoint "PHASE_A_RESUME_CHECKPOINT" "Phase A locality warm-up" "${PHASE_A_RESUME_CHECKPOINT}" PHASE_A_RESUME_ARGS
@@ -844,7 +857,7 @@ else
 fi
 
 # [9/10] frozen CheXlocalize external evaluation
-if stage_enabled 9; then
+if [[ "${RUN_CHEXLOCALIZE}" == "1" ]] && stage_enabled 9; then
   validate_frozen_manifest
   run_cmd 9 "frozen CheXlocalize external evaluation" \
     python -m anaprior.eval.eval_mscxr_afloc_mrsg \
@@ -861,7 +874,7 @@ if stage_enabled 9; then
     "chexlocalize_eval_summary_json" "${CHEXLOCALIZE_SUMMARY_JSON}" \
     "chexlocalize_case_diagnostics_json" "${CHEXLOCALIZE_CASE_DIAGNOSTICS_JSON}"
 else
-  echo "[9/10] skipping frozen CheXlocalize external evaluation"
+  echo "[9/10] CheXlocalize external evaluation disabled (RUN_CHEXLOCALIZE=0)"
 fi
 
 # [10/10] report and diagnostics bundle
@@ -872,7 +885,7 @@ if stage_enabled 10; then
     --metrics-dir "${METRIC_ROOT}" \
     --output-md "${REPORT_MD}"
   if [[ "${DRY_RUN}" != "1" ]]; then
-    python - "${BUNDLE_JSON}" "${REPORT_MD}" "${FROZEN_MANIFEST}" "${CACHE_REPORT}" "${PHASE_A_REPORT}" "${PHASE_B_REPORT}" "${PHASE_C_REPORT}" "${MSCXR_SUMMARY_JSON}" "${METRIC_SUMMARY_JSON}" "${CHEXLOCALIZE_SUMMARY_JSON}" <<'PY'
+    python - "${BUNDLE_JSON}" "${REPORT_MD}" "${FROZEN_MANIFEST}" "${CACHE_REPORT}" "${PHASE_A_REPORT}" "${PHASE_B_REPORT}" "${PHASE_C_REPORT}" "${MSCXR_SUMMARY_JSON}" "${METRIC_SUMMARY_JSON}" "${CHEXLOCALIZE_BUNDLE_ARGS[@]}" <<'PY'
 import hashlib
 import json
 import sys
@@ -917,6 +930,10 @@ echo "[AFLoc-MRSG] phase C report: ${PHASE_C_REPORT}"
 echo "[AFLoc-MRSG] frozen manifest: ${FROZEN_MANIFEST}"
 echo "[AFLoc-MRSG] MS-CXR summary: ${MSCXR_SUMMARY_JSON}"
 echo "[AFLoc-MRSG] score summary: ${METRIC_SUMMARY_JSON}"
-echo "[AFLoc-MRSG] CheXlocalize summary: ${CHEXLOCALIZE_SUMMARY_JSON}"
+if [[ "${RUN_CHEXLOCALIZE}" == "1" ]]; then
+  echo "[AFLoc-MRSG] CheXlocalize summary: ${CHEXLOCALIZE_SUMMARY_JSON}"
+else
+  echo "[AFLoc-MRSG] CheXlocalize summary: skipped"
+fi
 echo "[AFLoc-MRSG] report: ${REPORT_MD}"
 echo "[AFLoc-MRSG] bundle: ${BUNDLE_JSON}"

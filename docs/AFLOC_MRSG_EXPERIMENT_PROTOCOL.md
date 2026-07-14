@@ -23,8 +23,8 @@ Server-side environment variables or files:
 - `REFERENCE_HMAPS_ROOT`: baseline and DCEM reference heatmaps for Stage 8 scoring.
 - `LOCALIZATION_MS_CXR_JSON`: raw MS-CXR evaluation source.
 - `LOCALIZATION_MIMIC_IMG_DIR`: raw MS-CXR image root.
-- `CHEXLOCALIZE_TEST_JSON`: CheXlocalize test metadata.
-- `CHEXLOCALIZE_TEST_IMG_DIR`: CheXlocalize image root.
+- `CHEXLOCALIZE_TEST_JSON`: optional CheXlocalize test metadata, required only when `RUN_CHEXLOCALIZE=1`.
+- `CHEXLOCALIZE_TEST_IMG_DIR`: optional CheXlocalize image root, required only when `RUN_CHEXLOCALIZE=1`.
 
 Important runtime knobs:
 
@@ -33,6 +33,7 @@ Important runtime knobs:
 - `START_STAGE`: integer `0..10`.
 - `PREFLIGHT_ONLY=1`: validate inputs and stop.
 - `DRY_RUN=1`: print commands only.
+- `RUN_CHEXLOCALIZE=0`: default; skip the optional external CheXlocalize evaluation. Set to `1` only when its data is available.
 - `ALLOW_DIRTY_OUTROOT=1`: opt into rerunning with an existing non-empty `OUTROOT`.
 - `PHASE_A_RESUME_CHECKPOINT`, `PHASE_B_RESUME_CHECKPOINT`, `PHASE_C_RESUME_CHECKPOINT`: explicit same-phase resume only.
 
@@ -224,6 +225,8 @@ python -m anaprior.eval.score_mscxr_learned_repair_metrics \
 ```
 
 ### Stage 9: Frozen CheXlocalize External Evaluation
+
+This stage is optional and disabled by default. It runs only when `RUN_CHEXLOCALIZE=1`; otherwise Stage 9 and its bundle artifact are skipped.
 
 Command:
 
