@@ -27,6 +27,30 @@ def trainer_module():
     return module
 
 
+def test_score_output_uses_valid_tokens_and_local_heatmap_evidence() -> None:
+    module = trainer_module()
+    phrase_logits = torch.full((1, 3, 4, 4), -1.0e4)
+    phrase_logits[:, 0] = 1.0
+    concentrated = torch.zeros(1, 1, 4, 4)
+    concentrated[:, :, :1, :4] = 1.0
+    diffuse = torch.full((1, 1, 4, 4), 0.25)
+
+    concentrated_score = module._score_output(
+        SimpleNamespace(phrase_patch_logits=phrase_logits, final_heatmap=concentrated)
+    )
+    diffuse_score = module._score_output(
+        SimpleNamespace(phrase_patch_logits=phrase_logits, final_heatmap=diffuse)
+    )
+    more_padding = phrase_logits.clone()
+    more_padding[:, 1:] = -1.0e6
+    padded_score = module._score_output(
+        SimpleNamespace(phrase_patch_logits=more_padding, final_heatmap=concentrated)
+    )
+
+    assert concentrated_score > diffuse_score
+    assert torch.allclose(concentrated_score, padded_score)
+
+
 def _write_images_for_manifest(manifest_path: Path) -> None:
     rows = [
         json.loads(line)

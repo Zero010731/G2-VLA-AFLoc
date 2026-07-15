@@ -347,8 +347,14 @@ def _deterministic_patch_mask(
 
 
 def _score_output(output) -> torch.Tensor:
-    phrase_score = torch.sigmoid(output.phrase_patch_logits.amax(dim=(-2, -1)).mean(dim=1))
-    heatmap_score = output.final_heatmap.flatten(1).mean(dim=1)
+    token_scores = output.phrase_patch_logits.amax(dim=(-2, -1))
+    valid_tokens = token_scores > -1.0e3
+    phrase_logit = (token_scores * valid_tokens.to(token_scores.dtype)).sum(dim=1)
+    phrase_logit = phrase_logit / valid_tokens.sum(dim=1).clamp_min(1).to(token_scores.dtype)
+    phrase_score = torch.sigmoid(phrase_logit)
+    flat_heatmap = output.final_heatmap.flatten(1)
+    topk = max(1, round(flat_heatmap.shape[1] * 0.15))
+    heatmap_score = flat_heatmap.topk(topk, dim=1).values.mean(dim=1)
     return (0.7 * phrase_score + 0.3 * heatmap_score).clamp(0.0, 1.0)
 
 
@@ -551,7 +557,7 @@ def _batch_forward_and_loss(
         device=device,
     )
     output = model(image_features, phrase_features, patch_mask=patch_mask)
-    positive_scores = (_score_output(output) + 0.05).clamp(0.0, 1.0)
+    positive_scores = _score_output(output)
 
     teacher_target = None
     if phase == "locality":
@@ -566,7 +572,6 @@ def _batch_forward_and_loss(
             disease_descriptions=batch["disease_description"],
             device=device,
         )
-        negative_scores = (negative_scores - 0.05).clamp(0.0, 1.0)
 
     student_for_teacher = output
     if phase == "consistency":
@@ -594,7 +599,7 @@ def _batch_forward_and_loss(
             device=device,
         )
         student_for_teacher = model(equiv_features, equiv_phrases)
-        equiv_positive_scores = (_score_output(student_for_teacher) + 0.05).clamp(0.0, 1.0)
+        equiv_positive_scores = _score_output(student_for_teacher)
         equiv_negative_scores, equiv_negative_mask = _negative_scores(
             model=model,
             afloc_encoder=afloc_encoder,
@@ -603,7 +608,6 @@ def _batch_forward_and_loss(
             disease_descriptions=batch["disease_description"],
             device=device,
         )
-        equiv_negative_scores = (equiv_negative_scores - 0.05).clamp(0.0, 1.0)
         with torch.no_grad():
             weak_output = teacher(weak_features, weak_phrases)
         teacher_target = _build_teacher_target(

@@ -89,6 +89,16 @@ def test_phase_gate_accepts_noncollapsed_grounding_diagnostics() -> None:
     assert evaluate_phase_gate("grounding", diagnostics).passed is True
 
 
+def test_diagnostics_report_final_heatmap_distribution() -> None:
+    diagnostics = collect_mrsg_diagnostics(output=_student_output())
+
+    assert diagnostics["heatmap_mean"] == pytest.approx(0.43125)
+    assert diagnostics["heatmap_min"] == pytest.approx(0.1)
+    assert diagnostics["heatmap_max"] == pytest.approx(0.85)
+    assert 0.0 < diagnostics["heatmap_entropy"] < 1.0
+    assert diagnostics["active_area_ratio"] == pytest.approx(4.0 / 8.0)
+
+
 def test_locality_gate_requires_reconstruction_improvement_and_finite_gradients() -> None:
     diagnostics = {
         **healthy_grounding_diagnostics(),

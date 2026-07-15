@@ -42,6 +42,18 @@ def collect_mrsg_diagnostics(
 
     heatmap_std = _safe_stat(output.final_heatmap, "std", default=0.0)
     heatmap_variance = _safe_stat(output.final_heatmap, "var", default=0.0)
+    heatmap = output.final_heatmap.detach()
+    heatmap_mean = float(heatmap.mean().cpu().item())
+    heatmap_min = float(heatmap.min().cpu().item())
+    heatmap_max = float(heatmap.max().cpu().item())
+    probability = heatmap.clamp(1.0e-6, 1.0 - 1.0e-6)
+    heatmap_entropy = float(
+        (
+            -probability * probability.log()
+            - (1.0 - probability) * (1.0 - probability).log()
+        ).mean().div(math.log(2.0)).cpu().item()
+    )
+    active_area_ratio = float(heatmap.ge(0.5).float().mean().cpu().item())
     max_route_utilization, route_entropy = _route_utilization_diagnostics(
         output.query_route_weights.detach()
     )
@@ -64,6 +76,11 @@ def collect_mrsg_diagnostics(
     diagnostics = {
         "heatmap_std": heatmap_std,
         "heatmap_variance": heatmap_variance,
+        "heatmap_mean": heatmap_mean,
+        "heatmap_min": heatmap_min,
+        "heatmap_max": heatmap_max,
+        "heatmap_entropy": heatmap_entropy,
+        "active_area_ratio": active_area_ratio,
         "max_route_utilization": max_route_utilization,
         "route_utilization_entropy": route_entropy,
         "query_pairwise_cosine": query_pairwise_cosine,

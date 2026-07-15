@@ -68,8 +68,12 @@ class StandaloneDenseDecoder(nn.Module):
             ),
             dim=1,
         )
-        logits = self.output_head(self.blocks(self.input_projection(decoder_input)))
-        return torch.sigmoid(logits)
+        raw_refinement = self.output_head(self.blocks(self.input_projection(decoder_input)))
+        centered_refinement = raw_refinement - raw_refinement.mean(dim=(-2, -1), keepdim=True)
+        bounded_refinement = 0.5 * torch.tanh(centered_refinement)
+        routed_query_map = weighted_query_maps.sum(dim=1, keepdim=True)
+        routed_query_logits = torch.logit(routed_query_map.clamp(1.0e-4, 1.0 - 1.0e-4))
+        return torch.sigmoid(routed_query_logits + bounded_refinement)
 
     def _validate(
         self,

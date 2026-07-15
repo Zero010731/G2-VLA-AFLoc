@@ -167,6 +167,30 @@ def test_decoder_is_non_identity_and_has_no_base_fallback_behavior() -> None:
     assert not torch.allclose(heatmap, route_only)
 
 
+def test_decoder_global_bias_cannot_collapse_routed_spatial_evidence() -> None:
+    decoder = StandaloneDenseDecoder(feature_dim=16)
+    query_features = torch.rand(1, 4, 16, 8, 8)
+    query_outputs = make_query_outputs(query_features)
+    route_weights = torch.tensor([[0.4, 0.3, 0.2, 0.1]])
+    with torch.no_grad():
+        decoder.output_head.weight.zero_()
+        decoder.output_head.bias.fill_(1000.0)
+
+    heatmap = decoder(
+        torch.rand(1, 16, 8, 8),
+        query_outputs,
+        route_weights,
+        torch.rand(1, 4, 8, 8),
+    )
+    routed = (
+        torch.stack([torch.sigmoid(item.heatmap_logits[:, 0]) for item in query_outputs], dim=1)
+        * route_weights[:, :, None, None]
+    ).sum(dim=1, keepdim=True)
+
+    assert torch.allclose(heatmap, routed, atol=1.0e-5)
+    assert heatmap.std(unbiased=False) > 1.0e-3
+
+
 def test_decoder_rejects_invalid_shapes() -> None:
     decoder = StandaloneDenseDecoder(feature_dim=16)
     pyramid = torch.rand(2, 16, 8, 8)
