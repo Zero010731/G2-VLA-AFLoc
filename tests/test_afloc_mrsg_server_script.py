@@ -112,6 +112,9 @@ def _manifest_fixture(tmp_path: Path) -> tuple[list[str], dict[str, str], dict[s
         "PHASE_A_BATCH_SIZE": "8",
         "PHASE_B_BATCH_SIZE": "8",
         "PHASE_C_BATCH_SIZE": "8",
+        "MAX_TRAIN_STEPS": "5000",
+        "MAX_VALID_STEPS": "1000",
+        "DATALOADER_NUM_WORKERS": "4",
         "PHASE_A_LEARNING_RATE": "5e-4",
         "PHASE_B_LEARNING_RATE": "1e-4",
         "PHASE_C_LEARNING_RATE": "1e-4",
@@ -342,6 +345,17 @@ def test_mrsg_runner_uses_explicit_python39_runtime() -> None:
     assert '"${PYTHON_BIN}" -m anaprior.train.build_mrsg_image_report_cache' in script
     assert '"${PYTHON_BIN}" -m anaprior.train.train_afloc_mrsg' in script
     assert '"${PYTHON_BIN}" -m anaprior.eval.eval_mscxr_afloc_mrsg' in script
+
+
+def test_mrsg_runner_bounds_epoch_work_and_parallelizes_image_loading() -> None:
+    script = _script()
+
+    assert 'MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-5000}"' in script
+    assert 'MAX_VALID_STEPS="${MAX_VALID_STEPS:-1000}"' in script
+    assert 'DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"' in script
+    assert '--max-train-steps "${MAX_TRAIN_STEPS}"' in script
+    assert '--max-valid-steps "${MAX_VALID_STEPS}"' in script
+    assert '--num-workers "${DATALOADER_NUM_WORKERS}"' in script
 
 
 def test_mrsg_runner_passes_bash_n_when_available() -> None:

@@ -101,6 +101,9 @@ PHASE_C_EPOCHS="${PHASE_C_EPOCHS:-10}"
 PHASE_A_BATCH_SIZE="${PHASE_A_BATCH_SIZE:-8}"
 PHASE_B_BATCH_SIZE="${PHASE_B_BATCH_SIZE:-8}"
 PHASE_C_BATCH_SIZE="${PHASE_C_BATCH_SIZE:-8}"
+MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-5000}"
+MAX_VALID_STEPS="${MAX_VALID_STEPS:-1000}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 PHASE_A_LEARNING_RATE="${PHASE_A_LEARNING_RATE:-5e-4}"
 PHASE_B_LEARNING_RATE="${PHASE_B_LEARNING_RATE:-1e-4}"
 PHASE_C_LEARNING_RATE="${PHASE_C_LEARNING_RATE:-1e-4}"
@@ -178,6 +181,9 @@ export PHASE_C_EPOCHS
 export PHASE_A_BATCH_SIZE
 export PHASE_B_BATCH_SIZE
 export PHASE_C_BATCH_SIZE
+export MAX_TRAIN_STEPS
+export MAX_VALID_STEPS
+export DATALOADER_NUM_WORKERS
 export PHASE_A_LEARNING_RATE
 export PHASE_B_LEARNING_RATE
 export PHASE_C_LEARNING_RATE
@@ -444,6 +450,9 @@ payload = {
         "phase_a_batch_size": int(os.environ["PHASE_A_BATCH_SIZE"]),
         "phase_b_batch_size": int(os.environ["PHASE_B_BATCH_SIZE"]),
         "phase_c_batch_size": int(os.environ["PHASE_C_BATCH_SIZE"]),
+        "max_train_steps": int(os.environ["MAX_TRAIN_STEPS"]),
+        "max_valid_steps": int(os.environ["MAX_VALID_STEPS"]),
+        "dataloader_num_workers": int(os.environ["DATALOADER_NUM_WORKERS"]),
         "phase_a_learning_rate": float(os.environ["PHASE_A_LEARNING_RATE"]),
         "phase_b_learning_rate": float(os.environ["PHASE_B_LEARNING_RATE"]),
         "phase_c_learning_rate": float(os.environ["PHASE_C_LEARNING_RATE"]),
@@ -708,6 +717,9 @@ if stage_enabled 1; then
     --route-temperature "${ROUTE_TEMPERATURE}" \
     --epochs "${PHASE_A_EPOCHS}" \
     --batch-size "${PHASE_A_BATCH_SIZE}" \
+    --max-train-steps "${MAX_TRAIN_STEPS}" \
+    --max-valid-steps "${MAX_VALID_STEPS}" \
+    --num-workers "${DATALOADER_NUM_WORKERS}" \
     --learning-rate "${PHASE_A_LEARNING_RATE}" \
     --w-ground "${W_GROUND}" \
     --w-teacher "${W_TEACHER}" \
@@ -749,6 +761,9 @@ if stage_enabled 3; then
     --route-temperature "${ROUTE_TEMPERATURE}" \
     --epochs "${PHASE_B_EPOCHS}" \
     --batch-size "${PHASE_B_BATCH_SIZE}" \
+    --max-train-steps "${MAX_TRAIN_STEPS}" \
+    --max-valid-steps "${MAX_VALID_STEPS}" \
+    --num-workers "${DATALOADER_NUM_WORKERS}" \
     --learning-rate "${PHASE_B_LEARNING_RATE}" \
     --w-ground "${W_GROUND}" \
     --w-teacher "${W_TEACHER}" \
@@ -790,6 +805,9 @@ if stage_enabled 5; then
     --route-temperature "${ROUTE_TEMPERATURE}" \
     --epochs "${PHASE_C_EPOCHS}" \
     --batch-size "${PHASE_C_BATCH_SIZE}" \
+    --max-train-steps "${MAX_TRAIN_STEPS}" \
+    --max-valid-steps "${MAX_VALID_STEPS}" \
+    --num-workers "${DATALOADER_NUM_WORKERS}" \
     --learning-rate "${PHASE_C_LEARNING_RATE}" \
     --teacher-decay "${PHASE_C_TEACHER_DECAY}" \
     --w-ground "${W_GROUND}" \

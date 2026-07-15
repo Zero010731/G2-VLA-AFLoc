@@ -267,6 +267,7 @@ def _make_loader(
     batch_size: int,
     seed: int,
     shuffle: bool,
+    num_workers: int = 0,
 ) -> DataLoader:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
@@ -276,6 +277,9 @@ def _make_loader(
         shuffle=shuffle,
         generator=generator,
         collate_fn=_mrsg_collate,
+        num_workers=num_workers,
+        pin_memory=num_workers > 0,
+        persistent_workers=num_workers > 0,
     )
 
 
@@ -913,6 +917,8 @@ def _run_epoch(
     optimizer: torch.optim.Optimizer | None,
     weights: Mapping[str, float],
     teacher: MRSGTeacher | None,
+    max_steps: int | None = None,
+    num_workers: int = 0,
 ) -> dict[str, Any]:
     dataset.set_epoch(epoch)
     loader = _make_loader(
@@ -920,6 +926,7 @@ def _run_epoch(
         batch_size=batch_size,
         seed=seed + epoch,
         shuffle=optimizer is not None,
+        num_workers=num_workers,
     )
     is_training = optimizer is not None
     model.train(is_training)
@@ -943,6 +950,8 @@ def _run_epoch(
     diagnostic_examples = 0
 
     for step, raw_batch in enumerate(loader):
+        if max_steps is not None and step >= max_steps:
+            break
         batch = raw_batch
         if _geometry_batch_size(batch) == 0:
             continue
@@ -1032,6 +1041,8 @@ def _untrained_locality_baseline(
     seed: int,
     device: torch.device,
     weights: Mapping[str, float],
+    max_steps: int | None,
+    num_workers: int,
 ) -> float:
     baseline = _run_epoch(
         phase="locality",
@@ -1045,6 +1056,8 @@ def _untrained_locality_baseline(
         optimizer=None,
         weights=weights,
         teacher=None,
+        max_steps=max_steps,
+        num_workers=num_workers,
     )
     return float(baseline["losses"]["mask"])
 
@@ -1064,6 +1077,9 @@ def train_afloc_mrsg(
     model_config: MRSGConfig | Mapping[str, Any] | None = None,
     epochs: int = 1,
     batch_size: int = 2,
+    max_train_steps: int | None = None,
+    max_valid_steps: int | None = None,
+    num_workers: int = 0,
     learning_rate: float = 1.0e-3,
     teacher_decay: float = 0.99,
     w_ground: float = 1.0,
@@ -1091,6 +1107,12 @@ def train_afloc_mrsg(
     resume_path = None if resume_checkpoint is None else Path(resume_checkpoint)
     torch_device = torch.device(device)
     protocol_facts = _validate_protocol_manifest(protocol_path)
+    if max_train_steps is not None and max_train_steps <= 0:
+        raise ValueError("max_train_steps must be positive")
+    if max_valid_steps is not None and max_valid_steps <= 0:
+        raise ValueError("max_valid_steps must be positive")
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
 
     try:
         afloc_preprocessing = extract_afloc_image_preprocessing(afloc_encoder.afloc)
@@ -1181,6 +1203,8 @@ def train_afloc_mrsg(
             seed=seed,
             device=torch_device,
             weights=weights,
+            max_steps=max_valid_steps,
+            num_workers=num_workers,
         )
 
     last_report: dict[str, Any] | None = None
@@ -1201,6 +1225,8 @@ def train_afloc_mrsg(
             optimizer=optimizer,
             weights=weights,
             teacher=teacher,
+            max_steps=max_train_steps,
+            num_workers=num_workers,
         )
         _set_seed(seed + 1000 + epoch)
         valid_epoch = _run_epoch(
@@ -1215,6 +1241,8 @@ def train_afloc_mrsg(
             optimizer=None,
             weights=weights,
             teacher=teacher,
+            max_steps=max_valid_steps,
+            num_workers=num_workers,
         )
         diagnostics = collect_mrsg_diagnostics(
             output=valid_epoch["aggregate_output"],
@@ -1282,6 +1310,9 @@ def train_afloc_mrsg(
             "num_valid_rows": len(valid_dataset),
             "num_skipped_examples": train_epoch["num_skipped_examples"] + valid_epoch["num_skipped_examples"],
             "num_optimization_steps": train_epoch["num_optimization_steps"],
+            "max_train_steps": max_train_steps,
+            "max_valid_steps": max_valid_steps,
+            "num_workers": num_workers,
             "git_commit": payload["git_commit"],
             "model_config": payload["model_config"],
             "image_channels": payload["image_channels"],
@@ -1370,6 +1401,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--route-temperature", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--max-train-steps", type=int, default=None)
+    parser.add_argument("--max-valid-steps", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--teacher-decay", type=float, default=0.99)
     parser.add_argument("--w-ground", type=float, default=1.0)
@@ -1409,6 +1443,9 @@ def main(argv: list[str] | None = None) -> int:
         model_config=config_payload,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        max_train_steps=args.max_train_steps,
+        max_valid_steps=args.max_valid_steps,
+        num_workers=args.num_workers,
         learning_rate=args.learning_rate,
         teacher_decay=args.teacher_decay,
         w_ground=args.w_ground,
