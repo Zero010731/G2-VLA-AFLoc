@@ -63,13 +63,13 @@ BUNDLE_JSON="${BUNDLE_JSON:-${BUNDLE_ROOT}/bundle_manifest.json}"
 FROZEN_MANIFEST="${FROZEN_MANIFEST:-${OUTROOT}/frozen_experiment_manifest.json}"
 
 MIMIC_CSV="${MIMIC_CSV:-}"
-MSCXR_EXCLUSION_JSON="${MSCXR_EXCLUSION_JSON:-/mnt/mimic-cxr/ms-cxr_1.1.0/MS_CXR_Local_Alignment_v1.1.0.json}"
+MSCXR_EXCLUSION_JSON="${MSCXR_EXCLUSION_JSON:-/mnt/zhangran/ms-cxr_1.1.0/MS_CXR_Local_Alignment_v1.1.0.json}"
 AFLOC_CHECKPOINT="${AFLOC_CHECKPOINT:-/mnt/zhangran/AFLoc_weight_path/pretrained/Pretrained_CXR.ckpt}"
 MIMIC_IMAGE_ROOT="${MIMIC_IMAGE_ROOT:-/mnt/mimic-cxr/jpg}"
 DESCRIPTIONS_JSON="${DESCRIPTIONS_JSON:-${REPO_ROOT}/anaprior/configs/mrsg_disease_descriptions.json}"
 REFERENCE_HMAPS_ROOT="${REFERENCE_HMAPS_ROOT:-${ANAPRIOR_OUTPUT_BASE}/anaprior_stage_c_8class_phrase_validation_gate_alias_v2_dcem_v3/learned_repair_hmaps}"
 
-LOCALIZATION_MS_CXR_JSON="${LOCALIZATION_MS_CXR_JSON:-/mnt/mimic-cxr/ms-cxr_1.1.0/MS_CXR_Local_Alignment_v1.1.0.json}"
+LOCALIZATION_MS_CXR_JSON="${LOCALIZATION_MS_CXR_JSON:-/mnt/zhangran/ms-cxr_1.1.0/MS_CXR_Local_Alignment_v1.1.0.json}"
 LOCALIZATION_MIMIC_IMG_DIR="${LOCALIZATION_MIMIC_IMG_DIR:-/mnt/mimic-cxr/jpg}"
 CHEXLOCALIZE_TEST_JSON="${CHEXLOCALIZE_TEST_JSON:-/mnt/siat225_disk1/yh/datasets/hwj/Foundation-DATA-HWJ/chexlocalize/CheXlocalize/gt_segmentations_test.json}"
 CHEXLOCALIZE_TEST_IMG_DIR="${CHEXLOCALIZE_TEST_IMG_DIR:-/mnt/siat225_disk1/yh/datasets/hwj/Foundation-DATA-HWJ/chexlocalize/CheXpert/test}"
@@ -104,6 +104,7 @@ PHASE_C_BATCH_SIZE="${PHASE_C_BATCH_SIZE:-8}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-5000}"
 MAX_VALID_STEPS="${MAX_VALID_STEPS:-1000}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
+LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-100}"
 PHASE_A_LEARNING_RATE="${PHASE_A_LEARNING_RATE:-5e-4}"
 PHASE_B_LEARNING_RATE="${PHASE_B_LEARNING_RATE:-1e-4}"
 PHASE_C_LEARNING_RATE="${PHASE_C_LEARNING_RATE:-1e-4}"
@@ -184,6 +185,7 @@ export PHASE_C_BATCH_SIZE
 export MAX_TRAIN_STEPS
 export MAX_VALID_STEPS
 export DATALOADER_NUM_WORKERS
+export LOG_EVERY_STEPS
 export PHASE_A_LEARNING_RATE
 export PHASE_B_LEARNING_RATE
 export PHASE_C_LEARNING_RATE
@@ -453,6 +455,7 @@ payload = {
         "max_train_steps": int(os.environ["MAX_TRAIN_STEPS"]),
         "max_valid_steps": int(os.environ["MAX_VALID_STEPS"]),
         "dataloader_num_workers": int(os.environ["DATALOADER_NUM_WORKERS"]),
+        "log_every_steps": int(os.environ.get("LOG_EVERY_STEPS", "100")),
         "phase_a_learning_rate": float(os.environ["PHASE_A_LEARNING_RATE"]),
         "phase_b_learning_rate": float(os.environ["PHASE_B_LEARNING_RATE"]),
         "phase_c_learning_rate": float(os.environ["PHASE_C_LEARNING_RATE"]),
@@ -720,6 +723,7 @@ if stage_enabled 1; then
     --max-train-steps "${MAX_TRAIN_STEPS}" \
     --max-valid-steps "${MAX_VALID_STEPS}" \
     --num-workers "${DATALOADER_NUM_WORKERS}" \
+    --log-every-steps "${LOG_EVERY_STEPS}" \
     --learning-rate "${PHASE_A_LEARNING_RATE}" \
     --w-ground "${W_GROUND}" \
     --w-teacher "${W_TEACHER}" \
@@ -764,6 +768,7 @@ if stage_enabled 3; then
     --max-train-steps "${MAX_TRAIN_STEPS}" \
     --max-valid-steps "${MAX_VALID_STEPS}" \
     --num-workers "${DATALOADER_NUM_WORKERS}" \
+    --log-every-steps "${LOG_EVERY_STEPS}" \
     --learning-rate "${PHASE_B_LEARNING_RATE}" \
     --w-ground "${W_GROUND}" \
     --w-teacher "${W_TEACHER}" \
@@ -808,6 +813,7 @@ if stage_enabled 5; then
     --max-train-steps "${MAX_TRAIN_STEPS}" \
     --max-valid-steps "${MAX_VALID_STEPS}" \
     --num-workers "${DATALOADER_NUM_WORKERS}" \
+    --log-every-steps "${LOG_EVERY_STEPS}" \
     --learning-rate "${PHASE_C_LEARNING_RATE}" \
     --teacher-decay "${PHASE_C_TEACHER_DECAY}" \
     --w-ground "${W_GROUND}" \

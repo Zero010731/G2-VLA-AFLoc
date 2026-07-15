@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 import random
 import subprocess
+import sys
+import time
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -919,6 +921,7 @@ def _run_epoch(
     teacher: MRSGTeacher | None,
     max_steps: int | None = None,
     num_workers: int = 0,
+    log_every_steps: int = 100,
 ) -> dict[str, Any]:
     dataset.set_epoch(epoch)
     loader = _make_loader(
@@ -929,6 +932,9 @@ def _run_epoch(
         num_workers=num_workers,
     )
     is_training = optimizer is not None
+    mode = "train" if is_training else "valid"
+    total_steps = len(loader) if max_steps is None else min(len(loader), max_steps)
+    epoch_started = time.monotonic()
     model.train(is_training)
     if teacher is not None:
         teacher.eval()
@@ -981,6 +987,20 @@ def _run_epoch(
         totals["teacher"].append(float(loss.teacher.detach().cpu().item()))
         totals["mask"].append(float(loss.mask.detach().cpu().item()))
         totals["query"].append(float(loss.query.detach().cpu().item()))
+        completed_step = step + 1
+        if (
+            completed_step == 1
+            or completed_step % log_every_steps == 0
+            or completed_step == total_steps
+        ):
+            print(
+                f"[MRSG][{phase}][{mode}] epoch={epoch + 1} "
+                f"step={completed_step}/{total_steps} "
+                f"loss={totals['total'][-1]:.6f} "
+                f"elapsed_s={time.monotonic() - epoch_started:.1f}",
+                file=sys.stderr,
+                flush=True,
+            )
         last_output = _diagnostic_output_snapshot(output, limit=1)
         last_positive = _cpu_slice(positive_scores, 1)
         last_negative = _cpu_slice(negative_scores, 1)
@@ -1043,6 +1063,7 @@ def _untrained_locality_baseline(
     weights: Mapping[str, float],
     max_steps: int | None,
     num_workers: int,
+    log_every_steps: int,
 ) -> float:
     baseline = _run_epoch(
         phase="locality",
@@ -1058,6 +1079,7 @@ def _untrained_locality_baseline(
         teacher=None,
         max_steps=max_steps,
         num_workers=num_workers,
+        log_every_steps=log_every_steps,
     )
     return float(baseline["losses"]["mask"])
 
@@ -1080,6 +1102,7 @@ def train_afloc_mrsg(
     max_train_steps: int | None = None,
     max_valid_steps: int | None = None,
     num_workers: int = 0,
+    log_every_steps: int = 100,
     learning_rate: float = 1.0e-3,
     teacher_decay: float = 0.99,
     w_ground: float = 1.0,
@@ -1113,6 +1136,8 @@ def train_afloc_mrsg(
         raise ValueError("max_valid_steps must be positive")
     if num_workers < 0:
         raise ValueError("num_workers must be non-negative")
+    if log_every_steps <= 0:
+        raise ValueError("log_every_steps must be positive")
 
     try:
         afloc_preprocessing = extract_afloc_image_preprocessing(afloc_encoder.afloc)
@@ -1205,6 +1230,7 @@ def train_afloc_mrsg(
             weights=weights,
             max_steps=max_valid_steps,
             num_workers=num_workers,
+            log_every_steps=log_every_steps,
         )
 
     last_report: dict[str, Any] | None = None
@@ -1227,6 +1253,7 @@ def train_afloc_mrsg(
             teacher=teacher,
             max_steps=max_train_steps,
             num_workers=num_workers,
+            log_every_steps=log_every_steps,
         )
         _set_seed(seed + 1000 + epoch)
         valid_epoch = _run_epoch(
@@ -1243,6 +1270,7 @@ def train_afloc_mrsg(
             teacher=teacher,
             max_steps=max_valid_steps,
             num_workers=num_workers,
+            log_every_steps=log_every_steps,
         )
         diagnostics = collect_mrsg_diagnostics(
             output=valid_epoch["aggregate_output"],
@@ -1313,6 +1341,7 @@ def train_afloc_mrsg(
             "max_train_steps": max_train_steps,
             "max_valid_steps": max_valid_steps,
             "num_workers": num_workers,
+            "log_every_steps": log_every_steps,
             "git_commit": payload["git_commit"],
             "model_config": payload["model_config"],
             "image_channels": payload["image_channels"],
@@ -1404,6 +1433,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-train-steps", type=int, default=None)
     parser.add_argument("--max-valid-steps", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--log-every-steps", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--teacher-decay", type=float, default=0.99)
     parser.add_argument("--w-ground", type=float, default=1.0)
@@ -1446,6 +1476,7 @@ def main(argv: list[str] | None = None) -> int:
         max_train_steps=args.max_train_steps,
         max_valid_steps=args.max_valid_steps,
         num_workers=args.num_workers,
+        log_every_steps=args.log_every_steps,
         learning_rate=args.learning_rate,
         teacher_decay=args.teacher_decay,
         w_ground=args.w_ground,

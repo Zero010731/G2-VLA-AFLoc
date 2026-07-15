@@ -1033,6 +1033,9 @@ def test_cli_runs_tiny_locality_training_and_writes_report(
     payload = json.loads(captured.out)
     assert payload["phase"] == "locality"
     assert Path(payload["report"]).exists()
+    assert "[MRSG][locality][train] epoch=1 step=1/" in captured.err
+    assert "loss=" in captured.err
+    assert "elapsed_s=" in captured.err
 
 
 def test_cli_requires_protocol_manifest(tmp_path: Path) -> None:
