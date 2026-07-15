@@ -104,6 +104,37 @@ def test_query_regularization_detects_constant_and_identical_maps() -> None:
     ) > query_regularization_loss(diverse, uniform_routes(4))
 
 
+def test_query_group_keeps_gradient_on_collapsed_final_decoder_heatmap() -> None:
+    student = _student_output(batch=1)
+    final_logits = torch.full((1, 1, 4, 4), 4.0, requires_grad=True)
+    collapsed_final = torch.sigmoid(final_logits)
+    student = MRSGOutput(
+        final_heatmap=collapsed_final,
+        query_heatmaps=student.query_heatmaps,
+        query_route_weights=student.query_route_weights,
+        query_reliability=student.query_reliability,
+        phrase_patch_logits=student.phrase_patch_logits,
+        masked_predictions=student.masked_predictions,
+        source_targets=student.source_targets,
+        patch_mask=student.patch_mask,
+        query_reconstructed_phrase=student.query_reconstructed_phrase,
+        query_patch_gates=student.query_patch_gates,
+    )
+
+    loss = compute_mrsg_loss(
+        student=student,
+        positive_scores=torch.tensor([0.7]),
+        negative_scores=torch.tensor([[0.2]]),
+        pyramid=student,
+        teacher_target=None,
+        config=LossWeights(w_ground=0.0, w_teacher=0.0, w_mask=0.0, w_query=1.0),
+    )
+    loss.total.backward()
+
+    assert final_logits.grad is not None
+    assert final_logits.grad.abs().sum() > 0
+
+
 def test_compute_mrsg_loss_exposes_exactly_four_top_level_groups() -> None:
     student = _student_output()
     loss = compute_mrsg_loss(

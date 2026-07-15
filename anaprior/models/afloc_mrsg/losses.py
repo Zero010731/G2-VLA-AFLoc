@@ -128,6 +128,7 @@ def masked_patch_distillation_loss(
 def query_regularization_loss(
     query_heatmaps: torch.Tensor,
     route_weights: torch.Tensor,
+    final_heatmap: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if query_heatmaps.ndim != 4 or query_heatmaps.shape[1] != 4:
         raise ValueError("query_heatmaps must have shape [B,4,H,W]")
@@ -140,7 +141,20 @@ def query_regularization_loss(
     diversity = _pairwise_query_cosine(query_heatmaps).mean()
     noncollapse = F.relu(0.02 - query_heatmaps.var(dim=(-2, -1), unbiased=False)).mean()
     operator_structure = _operator_structure_loss(query_heatmaps)
-    return 0.25 * (route_balance + diversity + noncollapse + operator_structure)
+    query_loss = 0.25 * (route_balance + diversity + noncollapse + operator_structure)
+    if final_heatmap is None:
+        return query_loss
+    if final_heatmap.shape != query_heatmaps[:, :1].shape:
+        raise ValueError("final_heatmap must have shape [B,1,H,W]")
+    _require_finite("final_heatmap", final_heatmap)
+    routed_query_target = (
+        query_heatmaps.detach() * route_weights.detach()[:, :, None, None]
+    ).sum(dim=1, keepdim=True)
+    decoder_alignment = F.smooth_l1_loss(final_heatmap, routed_query_target)
+    final_noncollapse = F.relu(
+        0.02 - final_heatmap.var(dim=(-2, -1), unbiased=False)
+    ).mean()
+    return query_loss + decoder_alignment + final_noncollapse
 
 
 def compute_mrsg_loss(
@@ -183,7 +197,11 @@ def compute_mrsg_loss(
         teacher_target,
     )
     mask = _mask_group_loss(student, pyramid)
-    query = query_regularization_loss(student.query_heatmaps, student.query_route_weights)
+    query = query_regularization_loss(
+        student.query_heatmaps,
+        student.query_route_weights,
+        final_heatmap=student.final_heatmap,
+    )
 
     total = (
         ground_weight * grounding
