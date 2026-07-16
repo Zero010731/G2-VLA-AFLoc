@@ -123,13 +123,21 @@ def load_data(dataset, **kwargs):
         raise NotImplementedError
 
 
-def load_ms_cxr(merge=True, use_cxr_text=True, **kwargs):
+def load_ms_cxr(
+    merge=True,
+    use_cxr_text=True,
+    ms_cxr_json=None,
+    mimic_img_dir=None,
+    **kwargs,
+):
     print("loading data...")
+    annotation_path = MS_CXR_JSON if ms_cxr_json is None else Path(ms_cxr_json)
+    image_root = MIMIC_IMG_DIR if mimic_img_dir is None else Path(mimic_img_dir)
     if merge == True:
-        data = merge_annotation(MS_CXR_JSON, use_cxr_text=use_cxr_text)
+        data = merge_annotation(annotation_path, use_cxr_text=use_cxr_text)
     else:
-        data = get_annotation(MS_CXR_JSON)
-    data["path"] = list(map(lambda x: MIMIC_IMG_DIR/x.replace("files/", ""), data["path"]))
+        data = get_annotation(annotation_path)
+    data["path"] = list(map(lambda x: image_root/x.replace("files/", ""), data["path"]))
 
     return data
 

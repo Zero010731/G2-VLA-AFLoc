@@ -321,6 +321,8 @@ def test_mrsg_runner_scores_against_afloc_and_dcem_references() -> None:
     assert 'install_reference_hmap "${BASELINE_METHOD}"' in script
     assert 'install_reference_hmap "${DCEM_METHOD}"' in script
     assert '--dataset "MS_CXR"' in script
+    assert '--ms-cxr-json "${LOCALIZATION_MS_CXR_JSON}"' in script
+    assert '--mimic-img-dir "${LOCALIZATION_MIMIC_IMG_DIR}"' in script
     assert '--dataset "CHEXLOCALIZE"' in script
     assert '--split "test"' in script
 

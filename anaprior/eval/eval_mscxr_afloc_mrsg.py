@@ -374,6 +374,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--method-name", default=DEFAULT_METHOD_NAME)
     parser.add_argument("--max-cases", type=int, default=None)
+    parser.add_argument("--ms-cxr-json", type=Path, default=None)
+    parser.add_argument("--mimic-img-dir", type=Path, default=None)
     parser.add_argument("--prepared-inputs-npz", type=Path, default=None)
     parser.add_argument("--base-hmaps-npy", type=Path, default=None)
     parser.add_argument("--region-maps-npy", type=Path, default=None)
@@ -403,12 +405,23 @@ def validate_forbidden_args(args: argparse.Namespace) -> None:
         )
 
 
-def load_dataset_rows(dataset: str, split: str, max_cases: int | None = None) -> Any:
+def load_dataset_rows(
+    dataset: str,
+    split: str,
+    max_cases: int | None = None,
+    ms_cxr_json: Path | None = None,
+    mimic_img_dir: Path | None = None,
+) -> Any:
     from localization.datasets import load_data
 
     kwargs: dict[str, Any] = {}
     if dataset == "CHEXLOCALIZE":
         kwargs["split"] = split
+    if dataset == "MS_CXR":
+        if ms_cxr_json is not None:
+            kwargs["ms_cxr_json"] = ms_cxr_json
+        if mimic_img_dir is not None:
+            kwargs["mimic_img_dir"] = mimic_img_dir
     data = load_data(dataset=dataset, **kwargs)
     return coerce_rows(data, max_cases=max_cases)
 
@@ -416,7 +429,13 @@ def load_dataset_rows(dataset: str, split: str, max_cases: int | None = None) ->
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     validate_forbidden_args(args)
-    rows = load_dataset_rows(args.dataset, split=args.split, max_cases=args.max_cases)
+    rows = load_dataset_rows(
+        args.dataset,
+        split=args.split,
+        max_cases=args.max_cases,
+        ms_cxr_json=args.ms_cxr_json,
+        mimic_img_dir=args.mimic_img_dir,
+    )
     result = build_mscxr_afloc_mrsg_hmaps(
         data_rows=rows,
         dataset=args.dataset,

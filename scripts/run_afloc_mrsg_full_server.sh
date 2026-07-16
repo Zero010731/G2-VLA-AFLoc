@@ -844,6 +844,8 @@ if stage_enabled 7; then
     "${PYTHON_BIN}" -m anaprior.eval.eval_mscxr_afloc_mrsg \
     --dataset "MS_CXR" \
     --split "test" \
+    --ms-cxr-json "${LOCALIZATION_MS_CXR_JSON}" \
+    --mimic-img-dir "${LOCALIZATION_MIMIC_IMG_DIR}" \
     --afloc-checkpoint "${AFLOC_CHECKPOINT}" \
     --checkpoint "${PHASE_C_BEST}" \
     --outdir "${MSCXR_EVAL_ROOT}" \

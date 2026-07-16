@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 from anaprior.eval.eval_mscxr_afloc_mrsg import (
     build_mscxr_afloc_mrsg_hmaps,
     default_encode_case,
+    load_dataset_rows,
     main,
 )
 from tests.mrsg_test_utils import test_config as make_test_config
@@ -190,6 +192,44 @@ def test_cli_rejects_prepared_and_gate_arguments_before_loading_models(tmp_path:
             ]
         )
 
+
+def test_load_dataset_rows_passes_explicit_mscxr_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    annotation = tmp_path / "mscxr.json"
+    image_root = tmp_path / "jpg"
+    seen: dict[str, object] = {}
+
+    def fake_load_data(dataset, **kwargs):
+        seen["dataset"] = dataset
+        seen.update(kwargs)
+        return [
+            {
+                "path": str(image_root / "case.jpg"),
+                "label_text": "opacity",
+                "category": "Lung Opacity",
+            }
+        ]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "localization.datasets",
+        SimpleNamespace(load_data=fake_load_data),
+    )
+    rows = load_dataset_rows(
+        "MS_CXR",
+        split="test",
+        ms_cxr_json=annotation,
+        mimic_img_dir=image_root,
+    )
+
+    assert len(rows) == 1
+    assert seen == {
+        "dataset": "MS_CXR",
+        "ms_cxr_json": annotation,
+        "mimic_img_dir": image_root,
+    }
 
 def test_default_encode_case_uses_afloc_process_img_contract(tmp_path: Path) -> None:
     ckpt = write_fake_mrsg_checkpoint(tmp_path)
