@@ -82,13 +82,10 @@ class AFLocMRSG(nn.Module):
             phrase_features.attention_mask.detach(),
         )
 
-        gate_logits = torch.logit(
-            grounding.query_patch_gates.clamp(1.0e-4, 1.0 - 1.0e-4)
-        )
         grounded_query_logits = torch.cat(
             [item.heatmap_logits for item in query_outputs],
             dim=1,
-        ) + gate_logits
+        )
         grounded_query_outputs = tuple(
             replace(
                 item,

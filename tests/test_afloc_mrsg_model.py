@@ -47,6 +47,12 @@ def test_afloc_mrsg_forward_returns_direct_nonconstant_heatmap() -> None:
     assert output.final_heatmap.min().item() >= 0.0
     assert output.final_heatmap.max().item() <= 1.0
     assert output.final_heatmap.detach().std().item() > 0.0
+    extreme_query_fraction = (
+        (output.query_heatmaps.detach().lt(1.0e-3) | output.query_heatmaps.detach().gt(1.0 - 1.0e-3))
+        .float()
+        .mean()
+    )
+    assert extreme_query_fraction < 0.8
     assert output.query_heatmaps.shape == (2, 4, 16, 16)
     assert output.query_route_weights.shape == (2, 4)
     assert output.query_reliability.shape == (2, 4)
