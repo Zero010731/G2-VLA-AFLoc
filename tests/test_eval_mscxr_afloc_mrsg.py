@@ -65,7 +65,7 @@ def test_mscxr_mrsg_eval_uses_phrase_and_image_only(tmp_path: Path) -> None:
     assert set(seen_rows[0]) == {"case_id", "category", "dataset", "duplicate_index", "hmap_key", "label_text", "path"}
     assert set(result.hmaps) == {seen_rows[0]["case_id"]}
     payload = result.hmaps[str(seen_rows[0]["case_id"])]
-    assert payload["hmap"].shape == (2, 2)
+    assert payload["hmap"].shape == (224, 224)
     assert float(payload["hmap"].min()) == pytest.approx(0.0)
     assert float(payload["hmap"].max()) == pytest.approx(1.0)
     assert payload["path"] == str(tmp_path / "case-pna.jpg")
@@ -155,7 +155,7 @@ def test_chexlocalize_summary_marks_external_evaluation(tmp_path: Path) -> None:
 
     assert result.summary["external_evaluation"] is True
     assert result.summary["split"] == "test"
-    assert result.hmaps[result.case_diagnostics[0]["case_id"]]["hmap"].shape == (2, 2)
+    assert result.hmaps[result.case_diagnostics[0]["case_id"]]["hmap"].shape == (224, 224)
 
 
 def test_cli_rejects_prepared_and_gate_arguments_before_loading_models(tmp_path: Path) -> None:

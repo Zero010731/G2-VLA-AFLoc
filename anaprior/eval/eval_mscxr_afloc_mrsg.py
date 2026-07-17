@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 import pandas as pd
 import torch
+from torch.nn import functional as F
 
 from anaprior.features.afloc_preprocessing import (
     extract_afloc_image_preprocessing,
@@ -127,14 +128,27 @@ def normalize_output_heatmap(hmap: np.ndarray) -> np.ndarray:
     finite = np.isfinite(array)
     out = np.zeros_like(array, dtype=np.float32)
     if not finite.any():
-        return out
+        return _resize_heatmap_for_scoring(out)
     values = array[finite]
     low = float(values.min())
     high = float(values.max())
     if high <= low:
-        return out
+        return _resize_heatmap_for_scoring(out)
     out[finite] = (values - low) / (high - low)
-    return out
+    return _resize_heatmap_for_scoring(out)
+
+
+def _resize_heatmap_for_scoring(hmap: np.ndarray) -> np.ndarray:
+    if hmap.shape == (224, 224):
+        return hmap.astype(np.float32, copy=False)
+    tensor = torch.from_numpy(hmap).unsqueeze(0).unsqueeze(0)
+    resized = F.interpolate(
+        tensor,
+        size=(224, 224),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return resized[0, 0].numpy().astype(np.float32, copy=False)
 
 
 def load_checkpoint_reference(path: Path) -> dict[str, Any]:
