@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -143,8 +144,15 @@ def run_anchor_diagnostic(
     device: str = "cpu",
     max_cases: int | None = None,
     topk_fraction: float = 0.15,
+    bert_type: str | None = None,
+    hf_local_files_only: bool = True,
 ) -> dict[str, Any]:
     from localization.datasets import load_data
+
+    if bert_type:
+        os.environ["AFLOC_BERT_TYPE"] = str(bert_type)
+    if hf_local_files_only:
+        os.environ["AFLOC_HF_LOCAL_FILES_ONLY"] = "1"
 
     data = load_data(
         dataset="MS_CXR",
@@ -211,6 +219,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mimic-img-dir", required=True, type=Path)
     parser.add_argument("--outdir", required=True, type=Path)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--bert-type", required=True)
+    parser.add_argument("--hf-local-files-only", action="store_true", default=True)
     parser.add_argument("--max-cases", type=int, default=None)
     parser.add_argument("--topk-fraction", type=float, default=0.15)
     return parser.parse_args(argv)
@@ -226,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         max_cases=args.max_cases,
         topk_fraction=args.topk_fraction,
+        bert_type=args.bert_type,
+        hf_local_files_only=args.hf_local_files_only,
     )
     return 0
 
