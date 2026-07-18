@@ -20,6 +20,14 @@ def test_anchor_metrics_detects_correct_topk_and_pointing() -> None:
     assert metrics["pointing_hit"] == 1.0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_anchor_metrics_accepts_cpu_gt_mask_for_cuda_anchor() -> None:
+    anchor = torch.tensor([[0.9, 0.8], [0.1, 0.0]], device="cuda")
+    metrics = anchor_metrics(anchor, np.array([[1, 1], [0, 0]], dtype=np.float32), topk_fraction=0.5)
+
+    assert metrics["topk_iou"] == pytest.approx(1.0)
+
+
 def test_phrase_patch_anchor_fuses_three_scales_and_masks_tokens() -> None:
     image = {
         "l2": torch.tensor([[[[1.0, 0.0], [0.0, 0.0]], [[0.0, 1.0], [0.0, 0.0]]]]),

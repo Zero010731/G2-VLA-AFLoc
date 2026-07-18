@@ -78,7 +78,7 @@ def anchor_metrics(
         raise ValueError("anchor must have shape [H,W]")
     if not 0.0 < topk_fraction <= 1.0:
         raise ValueError("topk_fraction must be in (0,1]")
-    gt = torch.as_tensor(gt_mask, dtype=torch.float32)
+    gt = torch.as_tensor(gt_mask, dtype=torch.float32, device=anchor.device)
     if gt.ndim != 2:
         raise ValueError("gt_mask must have shape [H,W]")
     gt = F.interpolate(gt[None, None], size=anchor.shape, mode="nearest")[0, 0] > 0.0
