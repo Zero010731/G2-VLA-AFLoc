@@ -21,10 +21,12 @@ from anaprior.data.mrsg_dataset import MRSGDataset
 from anaprior.features.afloc_preprocessing import extract_afloc_image_preprocessing
 from anaprior.features.afloc_mrsg_encoder import FrozenAFLocMRSGEncoder
 from anaprior.models.afloc_mrsg import AFLocMRSG, MRSGConfig
+from anaprior.models.afloc_mrsg.anchor import compute_afloc_phrase_anchor
 from anaprior.models.afloc_mrsg.diagnostics import collect_mrsg_diagnostics, evaluate_phase_gate
 from anaprior.models.afloc_mrsg.losses import (
     MRSGGroupedLoss,
     compute_mrsg_loss,
+    cross_view_patch_consistency_loss,
     teacher_equivariance_loss,
 )
 from anaprior.models.afloc_mrsg.teacher import MRSGTeacher, TeacherTarget, teacher_confidence, transform_heatmap
@@ -520,6 +522,24 @@ def teacher_conf_transform(batch: dict[str, Any], index: int):
     )
 
 
+def _transform_batch_heatmap(
+    heatmap: torch.Tensor,
+    batch: dict[str, Any],
+    output_size: tuple[int, int],
+) -> torch.Tensor:
+    aligned = []
+    for index in range(_geometry_batch_size(batch)):
+        aligned.append(
+            transform_heatmap(
+                heatmap[index : index + 1],
+                teacher_conf_transform(batch, index),
+                output_size=output_size,
+                mode="bilinear",
+            )
+        )
+    return torch.cat(aligned, dim=0)
+
+
 def _batch_forward_and_loss(
     *,
     phase: str,
@@ -559,6 +579,63 @@ def _batch_forward_and_loss(
     output = model(image_features, phrase_features, patch_mask=patch_mask)
     positive_scores = _score_output(output)
 
+    anchor_heatmap = None
+    anchor_confidence = None
+    cross_view_loss = None
+    equiv_output = None
+    anchor_supported = (
+        phase in {"grounding", "consistency"}
+        and all(
+            int(getattr(image_features, f"img_emb_{name}").shape[1])
+            == int(phrase_features.word_embeddings.shape[2])
+            for name in ("l2", "l", "lf")
+        )
+    )
+    if phase in {"grounding", "consistency"}:
+        equiv_features = _encode_batch_images(
+            afloc_encoder,
+            equiv_images,
+            image_gray=equiv_image_gray,
+        )
+        equiv_phrases = _encode_batch_phrases(
+            afloc_encoder,
+            batch["equivariance_phrase"],
+            batch["disease_description"],
+            device=device,
+        )
+        equiv_output = model(equiv_features, equiv_phrases)
+        if anchor_supported:
+            anchor_source_features = _encode_batch_images(
+                afloc_encoder,
+                batch["geometry_applied_image"].to(device),
+                image_gray=batch["geometry_applied_gray"].to(device),
+            )
+            anchor_phrase_features = _encode_batch_phrases(
+                afloc_encoder,
+                batch["phrase"],
+                batch["disease_description"],
+                device=device,
+            )
+            anchor_heatmap, anchor_confidence, _ = compute_afloc_phrase_anchor(
+                anchor_source_features,
+                anchor_phrase_features,
+            )
+            aligned_student = _transform_batch_heatmap(
+                output.final_heatmap,
+                batch,
+                tuple(equiv_output.final_heatmap.shape[-2:]),
+            )
+            aligned_confidence = _transform_batch_heatmap(
+                anchor_confidence,
+                batch,
+                tuple(equiv_output.final_heatmap.shape[-2:]),
+            )
+            cross_view_loss = cross_view_patch_consistency_loss(
+                aligned_student,
+                equiv_output.final_heatmap,
+                aligned_confidence,
+            )
+
     teacher_target = None
     if phase == "locality":
         negative_scores = (positive_scores.detach().unsqueeze(1) * 0.5).clamp(0.0, 1.0)
@@ -587,18 +664,8 @@ def _batch_forward_and_loss(
             batch["disease_description"],
             device=device,
         )
-        equiv_features = _encode_batch_images(
-            afloc_encoder,
-            equiv_images,
-            image_gray=equiv_image_gray,
-        )
-        equiv_phrases = _encode_batch_phrases(
-            afloc_encoder,
-            batch["equivariance_phrase"],
-            batch["disease_description"],
-            device=device,
-        )
-        student_for_teacher = model(equiv_features, equiv_phrases)
+        assert equiv_output is not None
+        student_for_teacher = equiv_output
         equiv_positive_scores = _score_output(student_for_teacher)
         equiv_negative_scores, equiv_negative_mask = _negative_scores(
             model=model,
@@ -628,6 +695,9 @@ def _batch_forward_and_loss(
         teacher_target=None if phase == "consistency" else teacher_target,
         config=weights,
         target_phrase=phrase_features.sentence_embedding.detach(),
+        anchor_heatmap=anchor_heatmap,
+        anchor_confidence=anchor_confidence,
+        cross_view_loss=cross_view_loss,
     )
     if phase == "consistency":
         teacher_loss = teacher_equivariance_loss(
@@ -943,7 +1013,16 @@ def _run_epoch(
     if teacher is not None:
         teacher.eval()
 
-    totals = {"total": [], "grounding": [], "teacher": [], "mask": [], "query": []}
+    totals = {
+        "total": [],
+        "grounding": [],
+        "teacher": [],
+        "mask": [],
+        "query": [],
+        "anchor_grounding": [],
+        "cross_view_patch": [],
+        "anchor_confidence_mean": [],
+    }
     last_output = None
     last_positive = None
     last_negative = None
@@ -991,6 +1070,8 @@ def _run_epoch(
         totals["teacher"].append(float(loss.teacher.detach().cpu().item()))
         totals["mask"].append(float(loss.mask.detach().cpu().item()))
         totals["query"].append(float(loss.query.detach().cpu().item()))
+        for name in ("anchor_grounding", "cross_view_patch", "anchor_confidence_mean"):
+            totals[name].append(float(loss.diagnostics.get(name, 0.0)))
         completed_step = step + 1
         if (
             completed_step == 1

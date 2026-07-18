@@ -20,6 +20,44 @@ class MRSGGroupedLoss:
     diagnostics: dict[str, float]
 
 
+def anchor_patch_grounding_loss(
+    student_heatmap: torch.Tensor,
+    anchor_heatmap: torch.Tensor,
+    anchor_confidence: torch.Tensor,
+    margin: float = 0.1,
+) -> torch.Tensor:
+    """Keep learned evidence near reliable AFLoc patches and rank them above the rest."""
+    _validate_spatial_pair(student_heatmap, anchor_heatmap, "anchor_heatmap")
+    _validate_spatial_pair(student_heatmap, anchor_confidence, "anchor_confidence")
+    confidence = anchor_confidence.detach().clamp(0.05, 1.0)
+    anchor = anchor_heatmap.detach().clamp(0.0, 1.0)
+    alignment = ((student_heatmap - anchor).abs() * confidence).sum() / confidence.sum().clamp_min(1.0)
+    positive = (student_heatmap * anchor * confidence).sum() / (anchor * confidence).sum().clamp_min(1.0)
+    outside = ((student_heatmap * (1.0 - anchor)) * confidence).sum()
+    outside = outside / ((1.0 - anchor) * confidence).sum().clamp_min(1.0)
+    ranking = F.relu(float(margin) - positive + outside)
+    return alignment + ranking
+
+
+def cross_view_patch_consistency_loss(
+    student_heatmap: torch.Tensor,
+    transformed_student_heatmap: torch.Tensor,
+    confidence: torch.Tensor,
+) -> torch.Tensor:
+    _validate_spatial_pair(student_heatmap, transformed_student_heatmap, "transformed_student_heatmap")
+    _validate_spatial_pair(student_heatmap, confidence, "confidence")
+    weight = confidence.detach().clamp(0.05, 1.0)
+    return (
+        (student_heatmap - transformed_student_heatmap).abs() * weight
+    ).sum() / weight.sum().clamp_min(1.0)
+
+
+def _validate_spatial_pair(reference: torch.Tensor, value: torch.Tensor, name: str) -> None:
+    if value.shape != reference.shape:
+        raise ValueError(f"{name} must match student_heatmap shape")
+    _require_finite(name, value)
+
+
 def cross_modal_grounding_loss(
     positive_scores: torch.Tensor,
     negative_scores: torch.Tensor,
@@ -167,11 +205,16 @@ def compute_mrsg_loss(
     target_phrase: torch.Tensor | None = None,
     margin: float = 0.2,
     negative_mask: torch.Tensor | None = None,
+    anchor_heatmap: torch.Tensor | None = None,
+    anchor_confidence: torch.Tensor | None = None,
+    cross_view_loss: torch.Tensor | None = None,
 ) -> MRSGGroupedLoss:
     if not isinstance(student, MRSGOutput):
         raise ValueError("student must be an MRSGOutput")
     student.validate()
     ground_weight = _top_level_weight(config, "w_ground")
+    anchor_loss = _zero_like_loss(student.final_heatmap)
+    cross_view_value = _zero_like_loss(student.final_heatmap)
     if ground_weight > 0.0:
         if target_phrase is None:
             raise ValueError("target_phrase is required when grounding weight is active")
@@ -185,6 +228,18 @@ def compute_mrsg_loss(
             margin=margin,
             negative_mask=negative_mask,
         )
+        if anchor_heatmap is not None or anchor_confidence is not None:
+            if anchor_heatmap is None or anchor_confidence is None:
+                raise ValueError("anchor_heatmap and anchor_confidence must be provided together")
+            anchor_loss = anchor_patch_grounding_loss(
+                student.final_heatmap,
+                anchor_heatmap,
+                anchor_confidence,
+            )
+            grounding = grounding + anchor_loss
+        if cross_view_loss is not None:
+            cross_view_value = cross_view_loss
+            grounding = grounding + cross_view_loss
     else:
         grounding = _zero_like_loss(
             positive_scores,
@@ -229,6 +284,13 @@ def compute_mrsg_loss(
             "teacher_confident_coverage": _teacher_coverage(teacher_target),
             "query_pairwise_cosine": _float_detached(
                 _pairwise_query_cosine(student.query_heatmaps.detach()).mean()
+            ),
+            "anchor_grounding": _float_detached(anchor_loss),
+            "cross_view_patch": _float_detached(cross_view_value),
+            "anchor_confidence_mean": (
+                _float_detached(anchor_confidence.mean())
+                if anchor_confidence is not None
+                else 0.0
             ),
         },
     )

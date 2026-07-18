@@ -8,6 +8,8 @@ import torch
 from anaprior.models.afloc_mrsg.contracts import MRSGOutput
 from anaprior.models.afloc_mrsg import losses, teacher
 from anaprior.models.afloc_mrsg.losses import (
+    anchor_patch_grounding_loss,
+    cross_view_patch_consistency_loss,
     MRSGGroupedLoss,
     _pairwise_query_cosine,
     _total_variation,
@@ -18,6 +20,24 @@ from anaprior.models.afloc_mrsg.losses import (
     query_regularization_loss,
     teacher_equivariance_loss,
 )
+
+
+def test_anchor_patch_grounding_prefers_anchor_supported_region() -> None:
+    anchor = torch.tensor([[[[1.0, 1.0], [0.0, 0.0]]]])
+    confidence = torch.ones_like(anchor)
+    good = torch.tensor([[[[0.9, 0.8], [0.1, 0.1]]]])
+    bad = torch.tensor([[[[0.1, 0.1], [0.9, 0.8]]]])
+
+    assert anchor_patch_grounding_loss(good, anchor, confidence) < anchor_patch_grounding_loss(bad, anchor, confidence)
+
+
+def test_cross_view_patch_consistency_uses_confidence_weight() -> None:
+    first = torch.zeros(1, 1, 2, 2)
+    second = torch.ones_like(first)
+    low_confidence = torch.zeros_like(first)
+    high_confidence = torch.ones_like(first)
+
+    assert cross_view_patch_consistency_loss(first, second, low_confidence) < cross_view_patch_consistency_loss(first, second, high_confidence)
 from tests.mrsg_test_utils import uniform_routes
 
 
