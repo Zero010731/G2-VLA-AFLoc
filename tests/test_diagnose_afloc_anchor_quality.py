@@ -4,11 +4,44 @@ import numpy as np
 import pytest
 import torch
 
+from anaprior.eval import diagnose_afloc_anchor_quality as anchor_diagnostic
 from anaprior.eval.diagnose_afloc_anchor_quality import (
     anchor_metrics,
     phrase_patch_anchor,
     summarize_anchor_metrics,
 )
+
+
+def test_diagnostic_anchor_delegates_to_canonical(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = {"value": False}
+
+    def fake_compute(image_batch, phrase_batch):
+        called["value"] = True
+        anchor = torch.ones(1, 1, 2, 2)
+        confidence = torch.full_like(anchor, 0.75)
+        scales = {name: anchor.clone() for name in ("l2", "l", "lf")}
+        return anchor, confidence, scales
+
+    monkeypatch.setattr(
+        anchor_diagnostic,
+        "compute_afloc_phrase_anchor",
+        fake_compute,
+        raising=False,
+    )
+    image = {
+        "l2": torch.rand(1, 2, 2, 2),
+        "l": torch.rand(1, 2, 1, 1),
+        "lf": torch.rand(1, 2, 1, 1),
+    }
+    anchor, scales = anchor_diagnostic.phrase_patch_anchor(
+        image,
+        torch.rand(1, 2, 2),
+        torch.tensor([[True, True]]),
+    )
+
+    assert called["value"] is True
+    assert torch.equal(anchor, torch.ones(2, 2))
+    assert set(scales) == {"l2", "l", "lf"}
 
 
 def test_anchor_metrics_detects_correct_topk_and_pointing() -> None:

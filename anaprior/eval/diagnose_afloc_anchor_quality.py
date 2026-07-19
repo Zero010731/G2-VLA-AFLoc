@@ -19,6 +19,8 @@ import torch
 from torch.nn import functional as F
 
 from anaprior.features.afloc_mrsg_encoder import FrozenAFLocMRSGEncoder
+from anaprior.models.afloc_mrsg.anchor import compute_afloc_phrase_anchor
+from anaprior.models.afloc_mrsg.contracts import AFLocFeatureBatch, PhraseFeatureBatch
 
 
 def normalize_map(values: torch.Tensor) -> torch.Tensor:
@@ -38,35 +40,31 @@ def phrase_patch_anchor(
     """Return a multi-scale max-token cosine anchor on the finest grid."""
     if word_embeddings.ndim != 3 or word_embeddings.shape[0] != 1:
         raise ValueError("word_embeddings must have shape [1,T,C]")
-    valid = attention_mask[0].to(dtype=torch.bool)
-    if valid.ndim != 1 or not bool(valid.any()):
+    valid = attention_mask.to(dtype=torch.bool)
+    if valid.ndim != 2 or not bool(valid.any(dim=1).all()):
         raise ValueError("attention_mask must contain at least one valid token")
-
-    token_features = F.normalize(word_embeddings[0, valid], dim=-1)
-    scale_maps: dict[str, torch.Tensor] = {}
-    target_size = tuple(image_feature_maps["l2"].shape[-2:])
-    for name in ("l2", "l", "lf"):
-        feature_map = image_feature_maps[name][0]
-        if feature_map.ndim != 3:
-            raise ValueError(f"{name} must have shape [B,C,H,W]")
-        if feature_map.shape[0] != token_features.shape[1]:
-            raise ValueError(
-                f"{name} channel dimension {feature_map.shape[0]} does not match "
-                f"text dimension {token_features.shape[1]}"
-            )
-        patches = F.normalize(feature_map, dim=0).flatten(1).transpose(0, 1)
-        token_scores = patches @ token_features.transpose(0, 1)
-        scale_map = token_scores.amax(dim=1).reshape(feature_map.shape[-2:])
-        scale_map = normalize_map(scale_map)
-        if tuple(scale_map.shape) != target_size:
-            scale_map = F.interpolate(
-                scale_map[None, None],
-                size=target_size,
-                mode="bilinear",
-                align_corners=False,
-            )[0, 0]
-        scale_maps[name] = scale_map
-    return torch.stack(tuple(scale_maps[name] for name in ("l2", "l", "lf"))).mean(0), scale_maps
+    image_batch = AFLocFeatureBatch(
+        img_emb_l2=image_feature_maps["l2"],
+        img_emb_l=image_feature_maps["l"],
+        img_emb_lf=image_feature_maps["lf"],
+        image_gray=torch.empty(
+            word_embeddings.shape[0],
+            1,
+            0,
+            0,
+            device=word_embeddings.device,
+        ),
+    )
+    pooled_words = (word_embeddings * valid[:, :, None]).sum(dim=1)
+    pooled_words = pooled_words / valid.sum(dim=1, keepdim=True).clamp_min(1)
+    phrase_batch = PhraseFeatureBatch(
+        word_embeddings=word_embeddings,
+        sentence_embedding=pooled_words,
+        disease_description_embedding=pooled_words,
+        attention_mask=valid,
+    )
+    anchor, _, scale_maps = compute_afloc_phrase_anchor(image_batch, phrase_batch)
+    return anchor[0, 0], {name: value[0, 0] for name, value in scale_maps.items()}
 
 
 def anchor_metrics(
