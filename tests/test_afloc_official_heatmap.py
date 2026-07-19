@@ -5,7 +5,10 @@ import torch
 from scipy import ndimage
 from torch.nn import functional as F
 
-from anaprior.features.afloc_official_heatmap import compute_official_afloc_heatmap
+from anaprior.features.afloc_official_heatmap import (
+    compute_official_afloc_anchor_batch,
+    compute_official_afloc_heatmap,
+)
 
 
 def test_official_heatmap_matches_repository_localization_pipeline() -> None:
@@ -38,3 +41,29 @@ def test_official_heatmap_accepts_encoder_channel_first_batch() -> None:
 
     assert actual.shape == (32, 40)
     assert torch.isfinite(actual).all()
+
+
+def test_official_anchor_batch_is_detached_normalized_and_rank_preserving() -> None:
+    local = torch.tensor(
+        [
+            [[[0.0, 1.0], [2.0, 3.0]], [[1.0, 0.0], [0.0, 1.0]]],
+            [[[3.0, 2.0], [1.0, 0.0]], [[0.0, 1.0], [1.0, 0.0]]],
+        ],
+        requires_grad=True,
+    )
+    report = torch.tensor([[1.0, 0.0], [1.0, 0.0]], requires_grad=True)
+
+    anchor = compute_official_afloc_anchor_batch(
+        local,
+        report,
+        output_size=(2, 2),
+        sigma=0.0,
+    )
+
+    assert anchor.shape == (2, 1, 2, 2)
+    assert anchor.requires_grad is False
+    assert torch.isfinite(anchor).all()
+    assert anchor.min() > 0.0
+    assert anchor.max() < 1.0
+    assert torch.equal(anchor[0, 0].flatten().argsort(), local[0, 0].flatten().argsort())
+    assert torch.equal(anchor[1, 0].flatten().argsort(), local[1, 0].flatten().argsort())

@@ -52,6 +52,43 @@ def cross_view_patch_consistency_loss(
     ).sum() / weight.sum().clamp_min(1.0)
 
 
+def phrase_patch_refinement_loss(
+    final_heatmap: torch.Tensor,
+    phrase_patch_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Make the bounded residual follow dense phrase evidence without backpropagating into it."""
+    if final_heatmap.ndim != 4 or final_heatmap.shape[1] != 1:
+        raise ValueError("final_heatmap must have shape [B,1,H,W]")
+    if phrase_patch_logits.ndim != 4:
+        raise ValueError("phrase_patch_logits must have shape [B,T,H,W]")
+    if phrase_patch_logits.shape[0] != final_heatmap.shape[0]:
+        raise ValueError("phrase_patch_logits must share final_heatmap batch size")
+    if phrase_patch_logits.shape[-2:] != final_heatmap.shape[-2:]:
+        raise ValueError("phrase_patch_logits must share final_heatmap spatial shape")
+
+    logits = phrase_patch_logits.detach()
+    valid_tokens = logits.amax(dim=(-2, -1)).gt(-1.0e3)
+    valid_count = valid_tokens.sum(dim=1, keepdim=True).clamp_min(1)
+    evidence = (
+        logits.masked_fill(~valid_tokens[:, :, None, None], 0.0).sum(dim=1, keepdim=True)
+        / valid_count[:, :, None, None].to(dtype=logits.dtype)
+    )
+    evidence_mean = evidence.mean(dim=(-2, -1), keepdim=True)
+    evidence_std = evidence.std(dim=(-2, -1), keepdim=True, unbiased=False).clamp_min(1.0e-4)
+    target = torch.sigmoid(((evidence - evidence_mean) / evidence_std).clamp(-6.0, 6.0))
+
+    alignment = F.smooth_l1_loss(final_heatmap, target)
+    final_centered = final_heatmap - final_heatmap.mean(dim=(-2, -1), keepdim=True)
+    target_centered = target - target.mean(dim=(-2, -1), keepdim=True)
+    rank_alignment = 1.0 - F.cosine_similarity(
+        final_centered.flatten(1),
+        target_centered.flatten(1),
+        dim=1,
+        eps=1.0e-6,
+    ).mean()
+    return 0.5 * (alignment + rank_alignment)
+
+
 def _validate_spatial_pair(reference: torch.Tensor, value: torch.Tensor, name: str) -> None:
     if value.shape != reference.shape:
         raise ValueError(f"{name} must match student_heatmap shape")
@@ -180,19 +217,7 @@ def query_regularization_loss(
     noncollapse = F.relu(0.02 - query_heatmaps.var(dim=(-2, -1), unbiased=False)).mean()
     operator_structure = _operator_structure_loss(query_heatmaps)
     query_loss = 0.25 * (route_balance + diversity + noncollapse + operator_structure)
-    if final_heatmap is None:
-        return query_loss
-    if final_heatmap.shape != query_heatmaps[:, :1].shape:
-        raise ValueError("final_heatmap must have shape [B,1,H,W]")
-    _require_finite("final_heatmap", final_heatmap)
-    routed_query_target = (
-        query_heatmaps.detach() * route_weights.detach()[:, :, None, None]
-    ).sum(dim=1, keepdim=True)
-    decoder_alignment = F.smooth_l1_loss(final_heatmap, routed_query_target)
-    final_noncollapse = F.relu(
-        0.02 - final_heatmap.var(dim=(-2, -1), unbiased=False)
-    ).mean()
-    return query_loss + decoder_alignment + final_noncollapse
+    return query_loss
 
 
 def compute_mrsg_loss(
@@ -215,6 +240,7 @@ def compute_mrsg_loss(
     ground_weight = _top_level_weight(config, "w_ground")
     anchor_loss = _zero_like_loss(student.final_heatmap)
     cross_view_value = _zero_like_loss(student.final_heatmap)
+    patch_refinement = _zero_like_loss(student.final_heatmap)
     if ground_weight > 0.0:
         if target_phrase is None:
             raise ValueError("target_phrase is required when grounding weight is active")
@@ -228,6 +254,11 @@ def compute_mrsg_loss(
             margin=margin,
             negative_mask=negative_mask,
         )
+        patch_refinement = phrase_patch_refinement_loss(
+            student.final_heatmap,
+            student.phrase_patch_logits,
+        )
+        grounding = grounding + 0.25 * patch_refinement
         if anchor_heatmap is not None or anchor_confidence is not None:
             if anchor_heatmap is None or anchor_confidence is None:
                 raise ValueError("anchor_heatmap and anchor_confidence must be provided together")
@@ -287,6 +318,7 @@ def compute_mrsg_loss(
             ),
             "anchor_grounding": _float_detached(anchor_loss),
             "cross_view_patch": _float_detached(cross_view_value),
+            "phrase_patch_refinement": _float_detached(patch_refinement),
             "anchor_confidence_mean": (
                 _float_detached(anchor_confidence.mean())
                 if anchor_confidence is not None

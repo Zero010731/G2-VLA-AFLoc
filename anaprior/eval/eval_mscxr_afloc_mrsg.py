@@ -19,6 +19,7 @@ from anaprior.features.afloc_preprocessing import (
     preprocess_afloc_image_from_path,
 )
 from anaprior.features.afloc_mrsg_encoder import FrozenAFLocMRSGEncoder
+from anaprior.features.afloc_official_heatmap import compute_official_afloc_anchor_batch
 from anaprior.models.afloc_mrsg import AFLocMRSG, MRSGConfig
 
 
@@ -35,6 +36,23 @@ FORBIDDEN_ARG_NAMES = (
     "validation_gate_method_name",
     "lambda_override",
 )
+
+
+def compose_evaluation_heatmap(
+    full_resolution_anchor: torch.Tensor,
+    bounded_correction: torch.Tensor,
+) -> torch.Tensor:
+    if full_resolution_anchor.ndim != 4 or full_resolution_anchor.shape[1] != 1:
+        raise ValueError("full_resolution_anchor must have shape [B,1,H,W]")
+    if bounded_correction.ndim != 4 or bounded_correction.shape[:2] != full_resolution_anchor.shape[:2]:
+        raise ValueError("bounded_correction must have shape [B,1,h,w]")
+    correction = F.interpolate(
+        bounded_correction,
+        size=full_resolution_anchor.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    return torch.sigmoid(torch.logit(full_resolution_anchor.detach()) + correction)
 
 
 @dataclass(frozen=True)
@@ -163,6 +181,11 @@ def load_checkpoint_reference(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path} missing checkpoint field: model_config")
     if payload.get("model_state_dict") is None:
         raise ValueError(f"{path} missing checkpoint field: model_state_dict")
+    if (
+        payload.get("architecture") != "official_afloc_anchor_bounded_residual_v1"
+        or not bool(payload.get("uses_official_afloc_anchor"))
+    ):
+        raise ValueError(f"{path} is not an anchor-preserving MRSG checkpoint")
     model_config = dict(payload["model_config"])
     MRSGConfig(**model_config)
     state_dict = payload["model_state_dict"]
@@ -249,11 +272,35 @@ def default_encode_case(
             device=device,
             image_gray=image_gray,
         )
-        output = runtime["mrsg_model"](image_features, phrase_features)
+        full_resolution_anchor = compute_official_afloc_anchor_batch(
+            image_features.img_emb_l,
+            phrase_features.sentence_embedding,
+            output_size=(224, 224),
+        )
+        official_anchor = F.interpolate(
+            full_resolution_anchor,
+            size=tuple(image_features.img_emb_l2.shape[-2:]),
+            mode="bilinear",
+            align_corners=False,
+        )
+        output = runtime["mrsg_model"](
+            image_features,
+            phrase_features,
+            official_anchor=official_anchor,
+        )
+        evaluation_heatmap = compose_evaluation_heatmap(
+            full_resolution_anchor,
+            output.bounded_correction,
+        )
     return {
-        "hmap": output.final_heatmap[0, 0].detach().cpu().numpy().astype(np.float32),
+        "hmap": evaluation_heatmap[0, 0].detach().cpu().numpy().astype(np.float32),
         "query_route_weights": output.query_route_weights[0].detach().cpu().numpy().astype(np.float32).tolist(),
         "query_reliability": output.query_reliability[0].detach().cpu().numpy().astype(np.float32).tolist(),
+        "residual_abs_mean": float(output.residual_logits[0].detach().abs().mean().cpu().item()),
+        "correction_abs_mean": float(output.bounded_correction[0].detach().abs().mean().cpu().item()),
+        "final_anchor_mae": float(
+            (evaluation_heatmap[0] - full_resolution_anchor[0]).detach().abs().mean().cpu().item()
+        ),
     }
 
 
@@ -318,6 +365,9 @@ def build_mscxr_afloc_mrsg_hmaps(
                 "hmap_max": round(float(hmap.max()), 6),
                 "query_route_weights": list(encoded.get("query_route_weights", [])),
                 "query_reliability": list(encoded.get("query_reliability", [])),
+                "residual_abs_mean": float(encoded.get("residual_abs_mean", 0.0)),
+                "correction_abs_mean": float(encoded.get("correction_abs_mean", 0.0)),
+                "final_anchor_mae": float(encoded.get("final_anchor_mae", 0.0)),
             }
         )
 

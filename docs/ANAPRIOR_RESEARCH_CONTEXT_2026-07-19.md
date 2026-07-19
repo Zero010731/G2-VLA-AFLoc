@@ -540,3 +540,31 @@ final = sigmoid(logit(afloc_official_anchor) + confidence_bound * tanh(residual)
 
 No MRSG training, EMA teacher, gate, or residual tuning is allowed before
 official AFLoc parity is established.
+
+## 17. Phase 0b Passed and Phase 1 Forward Freeze
+
+Phase 0b passed exactly on 2026-07-19:
+
+- generated cases: 1162;
+- matched cases: 1162;
+- coverage: 1.0;
+- mean/min Pearson correlation: 1.0 / 1.0;
+- mean MAE and maximum absolute error: 0.0 / 0.0;
+- shape mismatches: 0.
+
+The official AFLoc heatmap is therefore approved as the forward base. Phase 1
+replaces the absolute decoder with:
+
+```text
+anchor = normalize(official AFLoc iel x teg heatmap)
+residual = shared MRSG queries and grounder
+correction = 0.5 * tanh(residual)
+final = sigmoid(logit(anchor) + correction)
+```
+
+The residual head is zero-initialized, so an untrained model recovers the
+official AFLoc anchor. The query path cannot replace the anchor, and the old
+final-to-routed-query alignment loss is removed. Phase 1 trains grounding only,
+with no EMA, no cross-view consistency, and no validation gate. It must show a
+nonzero residual, respect the correction bound, and preserve final-anchor
+Pearson correlation >= 0.8 before raw MS-CXR scoring is allowed.

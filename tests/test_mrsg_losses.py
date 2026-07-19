@@ -17,9 +17,26 @@ from anaprior.models.afloc_mrsg.losses import (
     compute_mrsg_loss,
     cross_modal_grounding_loss,
     masked_patch_distillation_loss,
+    phrase_patch_refinement_loss,
     query_regularization_loss,
     teacher_equivariance_loss,
 )
+
+
+def test_phrase_patch_refinement_drives_final_heatmap_without_target_gradients() -> None:
+    final = torch.full((1, 1, 2, 2), 0.5, requires_grad=True)
+    phrase_logits = torch.tensor(
+        [[[[3.0, 2.0], [-2.0, -3.0]], [[2.0, 1.0], [-1.0, -2.0]]]],
+        requires_grad=True,
+    )
+
+    loss = phrase_patch_refinement_loss(final, phrase_logits)
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert final.grad is not None
+    assert final.grad.abs().sum().item() > 0.0
+    assert phrase_logits.grad is None
 
 
 def test_anchor_patch_grounding_prefers_anchor_supported_region() -> None:
@@ -124,7 +141,7 @@ def test_query_regularization_detects_constant_and_identical_maps() -> None:
     ) > query_regularization_loss(diverse, uniform_routes(4))
 
 
-def test_query_group_keeps_gradient_on_collapsed_final_decoder_heatmap() -> None:
+def test_query_group_does_not_pull_final_heatmap_toward_query_maps() -> None:
     student = _student_output(batch=1)
     final_logits = torch.full((1, 1, 4, 4), 4.0, requires_grad=True)
     collapsed_final = torch.sigmoid(final_logits)
@@ -152,7 +169,7 @@ def test_query_group_keeps_gradient_on_collapsed_final_decoder_heatmap() -> None
     loss.total.backward()
 
     assert final_logits.grad is not None
-    assert final_logits.grad.abs().sum() > 0
+    assert final_logits.grad.abs().sum().item() == 0.0
 
 
 def test_compute_mrsg_loss_exposes_exactly_four_top_level_groups() -> None:

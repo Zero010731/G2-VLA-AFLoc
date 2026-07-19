@@ -12,7 +12,7 @@ from anaprior.models.afloc_mrsg.contracts import (
     MRSGOutput,
     PhraseFeatureBatch,
 )
-from anaprior.models.afloc_mrsg.dense_decoder import StandaloneDenseDecoder
+from anaprior.models.afloc_mrsg.dense_decoder import AnchorBoundedResidualDecoder
 from anaprior.models.afloc_mrsg.feature_pyramid import LocalityAlignedFeaturePyramid
 from anaprior.models.afloc_mrsg.grounding_transformer import (
     MultiQuerySparsePhrasePatchGrounder,
@@ -22,7 +22,7 @@ from anaprior.models.afloc_mrsg.query_operators import MorphologyQueryBank
 
 
 class AFLocMRSG(nn.Module):
-    """Standalone AFLoc-MRSG forward graph over frozen AFLoc feature batches."""
+    """Anchor-preserving AFLoc-MRSG forward graph over frozen AFLoc features."""
 
     def __init__(
         self,
@@ -53,13 +53,17 @@ class AFLocMRSG(nn.Module):
             num_heads=self.config.num_heads,
             topk_fraction=self.config.topk_fraction,
         )
-        self.decoder = StandaloneDenseDecoder(feature_dim=self.config.feature_dim)
+        self.decoder = AnchorBoundedResidualDecoder(
+            feature_dim=self.config.feature_dim,
+            residual_logit_bound=self.config.residual_logit_bound,
+        )
         self.last_forward_debug: dict[str, torch.Tensor] = {}
 
     def forward(
         self,
         image_features: AFLocFeatureBatch,
         phrase_features: PhraseFeatureBatch,
+        official_anchor: torch.Tensor,
         patch_mask: torch.Tensor | None = None,
     ) -> MRSGOutput:
         patch_mask = self._validate_and_prepare_inputs(
@@ -94,11 +98,12 @@ class AFLocMRSG(nn.Module):
             for index, item in enumerate(query_outputs)
         )
 
-        final_heatmap = self.decoder(
+        decoder_output = self.decoder(
             pyramid.fused,
             grounded_query_outputs,
             router.route_weights,
             grounding.query_patch_gates,
+            official_anchor,
         )
         query_heatmaps = torch.sigmoid(grounded_query_logits)
         phrase_patch_logits = (
@@ -111,7 +116,7 @@ class AFLocMRSG(nn.Module):
         )
 
         output = MRSGOutput(
-            final_heatmap=final_heatmap,
+            final_heatmap=decoder_output.final_heatmap,
             query_heatmaps=query_heatmaps,
             query_route_weights=router.route_weights,
             query_reliability=query_reliability,
@@ -121,12 +126,18 @@ class AFLocMRSG(nn.Module):
             patch_mask=patch_mask,
             query_reconstructed_phrase=grounding.query_reconstructed_phrase,
             query_patch_gates=grounding.query_patch_gates,
+            anchor_heatmap=official_anchor.detach(),
+            residual_logits=decoder_output.residual_logits,
+            bounded_correction=decoder_output.bounded_correction,
+            correction_bound=decoder_output.correction_bound,
         )
         output.validate()
         self.last_forward_debug = {
             "grounded_query_logits": grounded_query_logits.detach(),
             "query_phrase_patch_logits": grounding.query_phrase_patch_logits.detach(),
             "query_patch_gates": grounding.query_patch_gates.detach(),
+            "residual_logits": decoder_output.residual_logits.detach(),
+            "bounded_correction": decoder_output.bounded_correction.detach(),
         }
         return output
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -89,6 +90,25 @@ def test_phase_gate_accepts_noncollapsed_grounding_diagnostics() -> None:
     assert evaluate_phase_gate("grounding", diagnostics).passed is True
 
 
+def test_grounding_gate_rejects_anchor_destruction_or_inactive_residual() -> None:
+    destroyed = {
+        **healthy_grounding_diagnostics(),
+        "all_module_gradient_norms_finite": 1.0,
+        "residual_abs_mean": 0.2,
+        "correction_max_abs": 0.4,
+        "correction_bound_max": 0.5,
+        "final_anchor_pearson": 0.2,
+    }
+    inactive = {
+        **destroyed,
+        "final_anchor_pearson": 0.95,
+        "residual_abs_mean": 0.0,
+    }
+
+    assert evaluate_phase_gate("grounding", destroyed).reasons == ("anchor_rank_not_preserved",)
+    assert evaluate_phase_gate("grounding", inactive).reasons == ("inactive_residual",)
+
+
 def test_diagnostics_report_final_heatmap_distribution() -> None:
     diagnostics = collect_mrsg_diagnostics(output=_student_output())
 
@@ -97,6 +117,36 @@ def test_diagnostics_report_final_heatmap_distribution() -> None:
     assert diagnostics["heatmap_max"] == pytest.approx(0.85)
     assert 0.0 < diagnostics["heatmap_entropy"] < 1.0
     assert diagnostics["active_area_ratio"] == pytest.approx(4.0 / 8.0)
+
+
+def test_diagnostics_report_anchor_preserving_residual_amplitude() -> None:
+    student = _student_output()
+    anchor = student.final_heatmap.detach().clone()
+    residual = torch.tensor(
+        [
+            [[[0.2, -0.1], [0.0, 0.3]]],
+            [[[0.1, -0.2], [0.4, 0.0]]],
+        ]
+    )
+    correction = 0.5 * torch.tanh(residual)
+    refined = torch.sigmoid(torch.logit(anchor) + correction)
+    student = replace(
+        student,
+        final_heatmap=refined,
+        anchor_heatmap=anchor,
+        residual_logits=residual,
+        bounded_correction=correction,
+        correction_bound=torch.full_like(residual, 0.5),
+    )
+
+    diagnostics = collect_mrsg_diagnostics(output=student)
+
+    assert diagnostics["residual_abs_mean"] == pytest.approx(residual.abs().mean().item())
+    assert diagnostics["residual_max_abs"] == pytest.approx(0.4)
+    assert diagnostics["correction_abs_mean"] == pytest.approx(correction.abs().mean().item())
+    assert diagnostics["correction_max_abs"] <= 0.5
+    assert diagnostics["final_anchor_mae"] > 0.0
+    assert diagnostics["final_anchor_pearson"] > 0.9
 
 
 def test_locality_gate_requires_reconstruction_improvement_and_finite_gradients() -> None:

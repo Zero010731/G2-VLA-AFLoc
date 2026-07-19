@@ -36,12 +36,17 @@ def _masked_prediction_loss(output) -> torch.Tensor:
     return torch.stack(losses).mean()
 
 
-def test_afloc_mrsg_forward_returns_direct_nonconstant_heatmap() -> None:
+def _official_anchor(batch: int = 2) -> torch.Tensor:
+    return torch.rand(batch, 1, 16, 16).clamp(1.0e-4, 1.0 - 1.0e-4)
+
+
+def test_afloc_mrsg_forward_returns_anchor_preserving_nonconstant_heatmap() -> None:
     torch.manual_seed(31)
     AFLocMRSG = model_class()
     model = AFLocMRSG(make_test_config(), image_channels=(32, 64, 128))
 
-    output = model(fake_image_features(), fake_phrase_features())
+    anchor = _official_anchor()
+    output = model(fake_image_features(), fake_phrase_features(), official_anchor=anchor)
 
     output.validate()
     assert output.final_heatmap.min().item() >= 0.0
@@ -62,6 +67,9 @@ def test_afloc_mrsg_forward_returns_direct_nonconstant_heatmap() -> None:
     assert output.patch_mask is not None
     assert output.query_reconstructed_phrase is not None
     assert output.query_patch_gates is not None
+    assert torch.allclose(output.anchor_heatmap, anchor)
+    assert output.residual_logits is not None
+    assert output.bounded_correction is not None
 
 
 def test_afloc_mrsg_has_no_dcem_region_or_disease_id_inputs() -> None:
@@ -78,7 +86,13 @@ def test_afloc_mrsg_has_no_dcem_region_or_disease_id_inputs() -> None:
     }
 
     assert forbidden.isdisjoint(parameters)
-    assert tuple(parameters) == ("self", "image_features", "phrase_features", "patch_mask")
+    assert tuple(parameters) == (
+        "self",
+        "image_features",
+        "phrase_features",
+        "official_anchor",
+        "patch_mask",
+    )
 
 
 def test_afloc_mrsg_routes_all_four_query_branches_into_loss_gradients() -> None:
@@ -86,8 +100,16 @@ def test_afloc_mrsg_routes_all_four_query_branches_into_loss_gradients() -> None
     AFLocMRSG = model_class()
     model = AFLocMRSG(make_test_config(), image_channels=(32, 64, 128))
 
-    output = model(fake_image_features(), fake_phrase_features())
-    output.final_heatmap.mean().backward()
+    output = model(
+        fake_image_features(),
+        fake_phrase_features(),
+        official_anchor=_official_anchor(),
+    )
+    (
+        output.final_heatmap.mean()
+        + output.query_heatmaps.mean()
+        + output.phrase_patch_logits.mean()
+    ).backward()
 
     for index, operator in enumerate(model.query_bank.operators):
         grad = operator.output_head.weight.grad
@@ -116,7 +138,7 @@ def test_afloc_mrsg_keeps_afloc_inputs_frozen_at_parameter_boundary() -> None:
         attention_mask=torch.ones(2, 7, dtype=torch.bool),
     )
 
-    output = model(image_features, phrase_features)
+    output = model(image_features, phrase_features, official_anchor=_official_anchor())
     output.final_heatmap.mean().backward()
 
     assert image_features.img_emb_l2.grad is None
@@ -142,12 +164,21 @@ def test_afloc_mrsg_combined_task10_loss_preserves_auxiliary_gradients() -> None
         image_gray=torch.rand(2, 1, 224, 224, requires_grad=True),
     )
 
-    output = model(image_features, fake_phrase_features(), patch_mask=patch_mask)
+    output = model(
+        image_features,
+        fake_phrase_features(),
+        official_anchor=_official_anchor(),
+        patch_mask=patch_mask,
+    )
     assert output.query_reconstructed_phrase is not None
     loss = (
         output.final_heatmap.mean()
         + _masked_prediction_loss(output)
         + output.query_reconstructed_phrase.square().mean()
+        + (
+            output.query_heatmaps
+            * output.query_route_weights[:, :, None, None]
+        ).square().mean()
     )
     loss.backward()
 
@@ -180,7 +211,11 @@ def test_afloc_mrsg_phrase_patch_logits_are_route_weighted_across_queries() -> N
     AFLocMRSG = model_class()
     model = AFLocMRSG(make_test_config(), image_channels=(32, 64, 128))
 
-    output = model(fake_image_features(), fake_phrase_features())
+    output = model(
+        fake_image_features(),
+        fake_phrase_features(),
+        official_anchor=_official_anchor(),
+    )
     internals = model.last_forward_debug
     expected = (
         internals["query_phrase_patch_logits"]
@@ -198,8 +233,13 @@ def test_afloc_mrsg_rejects_invalid_patch_masks_and_batch_mismatch() -> None:
         model(
             fake_image_features(),
             fake_phrase_features(),
+            official_anchor=_official_anchor(),
             patch_mask=torch.zeros(2, 1, 15, 16, dtype=torch.bool),
         )
 
     with pytest.raises(ValueError, match="same batch"):
-        model(fake_image_features(batch=2), fake_phrase_features(batch=1))
+        model(
+            fake_image_features(batch=2),
+            fake_phrase_features(batch=1),
+            official_anchor=_official_anchor(),
+        )

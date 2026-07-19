@@ -13,6 +13,7 @@ class MRSGConfig:
     focal_slots: int = 4
     topk_fraction: float = 0.15
     route_temperature: float = 1.0
+    residual_logit_bound: float = 0.5
     query_names: tuple[str, ...] = ("focal", "diffuse", "boundary", "structural")
 
     def __post_init__(self) -> None:
@@ -26,6 +27,8 @@ class MRSGConfig:
             raise ValueError("feature_dim must be divisible by num_heads")
         if not 0.0 < self.topk_fraction <= 1.0:
             raise ValueError("topk_fraction must be in (0,1]")
+        if not 0.0 < self.residual_logit_bound <= 2.0:
+            raise ValueError("residual_logit_bound must be in (0,2]")
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,10 @@ class MRSGOutput:
     patch_mask: torch.Tensor | None = None
     query_reconstructed_phrase: torch.Tensor | None = None
     query_patch_gates: torch.Tensor | None = None
+    anchor_heatmap: torch.Tensor | None = None
+    residual_logits: torch.Tensor | None = None
+    bounded_correction: torch.Tensor | None = None
+    correction_bound: torch.Tensor | None = None
 
     def validate(self) -> None:
         if self.final_heatmap.ndim != 4:
@@ -77,6 +84,30 @@ class MRSGOutput:
         if self.phrase_patch_logits.shape[-2:] != (height, width):
             raise ValueError("phrase_patch_logits must have the same spatial shape")
         self._validate_training_fields(batch, height, width)
+        self._validate_refinement_fields(batch, height, width)
+
+    def _validate_refinement_fields(self, batch: int, height: int, width: int) -> None:
+        values = (
+            self.anchor_heatmap,
+            self.residual_logits,
+            self.bounded_correction,
+            self.correction_bound,
+        )
+        if all(value is None for value in values):
+            return
+        if any(value is None for value in values):
+            raise ValueError("all anchor-preserving refinement fields must be provided together")
+        expected = (batch, 1, height, width)
+        for name, value in zip(
+            ("anchor_heatmap", "residual_logits", "bounded_correction", "correction_bound"),
+            values,
+        ):
+            if value.shape != expected:
+                raise ValueError(f"{name} must have shape [B,1,H,W]")
+            if not torch.isfinite(value).all():
+                raise ValueError(f"{name} must contain finite values")
+        if self.anchor_heatmap.requires_grad:
+            raise ValueError("anchor_heatmap must be detached")
 
     def _validate_training_fields(self, batch: int, height: int, width: int) -> None:
         if self.masked_predictions is not None or self.source_targets is not None:

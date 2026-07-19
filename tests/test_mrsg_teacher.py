@@ -65,7 +65,11 @@ def test_teacher_forward_detaches_targets_and_keeps_mrsg_only_parameters() -> No
     student = AFLocMRSG(make_test_config(), image_channels=(32, 64, 128))
     teacher = MRSGTeacher(student, decay=0.95)
 
-    output = teacher(fake_image_features(), fake_phrase_features())
+    output = teacher(
+        fake_image_features(),
+        fake_phrase_features(),
+        official_anchor=torch.rand(2, 1, 16, 16).clamp(1.0e-4, 1.0 - 1.0e-4),
+    )
 
     assert not output.final_heatmap.requires_grad
     assert not output.query_heatmaps.requires_grad

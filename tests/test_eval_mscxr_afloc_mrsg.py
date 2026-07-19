@@ -11,16 +11,28 @@ import pytest
 import torch
 
 from anaprior.eval.eval_mscxr_afloc_mrsg import (
+    compose_evaluation_heatmap,
     build_mscxr_afloc_mrsg_hmaps,
     default_encode_case,
     load_dataset_rows,
     main,
 )
+
+
+def test_evaluation_composition_recovers_full_resolution_anchor_at_zero_residual() -> None:
+    anchor = torch.rand(1, 1, 224, 224).clamp(1.0e-4, 1.0 - 1.0e-4)
+    correction = torch.zeros(1, 1, 16, 16)
+
+    actual = compose_evaluation_heatmap(anchor, correction)
+
+    assert torch.allclose(actual, anchor, atol=1.0e-6)
 from tests.mrsg_test_utils import test_config as make_test_config
 
 
 def write_fake_mrsg_checkpoint(tmp_path: Path, **overrides) -> Path:
     payload = {
+        "architecture": "official_afloc_anchor_bounded_residual_v1",
+        "uses_official_afloc_anchor": True,
         "model_config": asdict(make_test_config()),
         "model_state_dict": {},
         "image_channels": [32, 64, 128],
@@ -29,6 +41,25 @@ def write_fake_mrsg_checkpoint(tmp_path: Path, **overrides) -> Path:
     path = tmp_path / "mrsg.pt"
     torch.save(payload, path)
     return path
+
+
+def test_evaluation_rejects_legacy_absolute_decoder_checkpoint(tmp_path: Path) -> None:
+    checkpoint = write_fake_mrsg_checkpoint(
+        tmp_path,
+        architecture="standalone_absolute_decoder",
+    )
+
+    with pytest.raises(ValueError, match="anchor-preserving"):
+        build_mscxr_afloc_mrsg_hmaps(
+            data_rows=[{
+                "path": str(tmp_path / "case.jpg"),
+                "label_text": "opacity",
+                "category": "Lung Opacity",
+            }],
+            dataset="MS_CXR",
+            checkpoint=checkpoint,
+            encode_case=lambda row, checkpoint, device: {"hmap": np.ones((2, 2))},
+        )
 
 
 def test_mscxr_mrsg_eval_uses_phrase_and_image_only(tmp_path: Path) -> None:
@@ -292,19 +323,26 @@ def test_default_encode_case_uses_afloc_process_img_contract(tmp_path: Path) -> 
                     "ImageFeatures",
                     (),
                     {
+                        "img_emb_l": images,
+                        "img_emb_l2": images,
                         "image_gray": (
                             images.mean(dim=1, keepdim=True)
                             if image_gray is None
                             else image_gray
-                        )
+                        ),
                     },
                 )(),
-                object(),
+                type(
+                    "PhraseFeatures",
+                    (),
+                    {"sentence_embedding": torch.ones(1, images.shape[1])},
+                )(),
             )
 
     class FakeMRSGModel:
-        def __call__(self, image_features, phrase_features):
+        def __call__(self, image_features, phrase_features, official_anchor):
             assert torch.equal(image_features.image_gray, processed.mean(dim=1, keepdim=True))
+            assert official_anchor.shape == (1, 1, 7, 5)
             heatmap = torch.tensor([[[[1.0, 3.0], [5.0, 7.0]]]], dtype=torch.float32)
             return type(
                 "Output",
@@ -313,6 +351,9 @@ def test_default_encode_case_uses_afloc_process_img_contract(tmp_path: Path) -> 
                     "final_heatmap": heatmap,
                     "query_route_weights": torch.tensor([[0.4, 0.3, 0.2, 0.1]], dtype=torch.float32),
                     "query_reliability": torch.tensor([[0.7, 0.2, 0.1]], dtype=torch.float32),
+                    "anchor_heatmap": heatmap,
+                    "residual_logits": torch.zeros_like(heatmap),
+                    "bounded_correction": torch.zeros_like(heatmap),
                 },
             )()
 
@@ -349,7 +390,8 @@ def test_default_encode_case_uses_afloc_process_img_contract(tmp_path: Path) -> 
     assert seen["phrases"] == ["right pleural effusion"]
     assert seen["descriptions"] == ["Pleural Effusion"]
     assert seen["image_gray"] is None
-    assert result.case_diagnostics[0]["hmap_max"] == pytest.approx(1.0)
+    assert result.case_diagnostics[0]["residual_abs_mean"] == pytest.approx(0.0)
+    assert result.case_diagnostics[0]["final_anchor_mae"] == pytest.approx(0.0)
 
 
 def test_default_encode_case_fails_clearly_without_afloc_process_img(tmp_path: Path) -> None:
@@ -409,18 +451,24 @@ def test_default_encode_case_supplies_preprocessed_grayscale_override_when_cfg_i
                     "ImageFeatures",
                     (),
                     {
+                        "img_emb_l": images,
+                        "img_emb_l2": images,
                         "image_gray": (
                             images.mean(dim=1, keepdim=True)
                             if image_gray is None
                             else image_gray
-                        )
+                        ),
                     },
                 )(),
-                object(),
+                type(
+                    "PhraseFeatures",
+                    (),
+                    {"sentence_embedding": torch.ones(1, images.shape[1])},
+                )(),
             )
 
     class FakeMRSGModel:
-        def __call__(self, image_features, phrase_features):
+        def __call__(self, image_features, phrase_features, official_anchor):
             assert image_features.image_gray.shape == (1, 1, 8, 8)
             assert float(image_features.image_gray.min()) >= 0.0
             assert float(image_features.image_gray.max()) <= 1.0
@@ -432,6 +480,9 @@ def test_default_encode_case_supplies_preprocessed_grayscale_override_when_cfg_i
                     "final_heatmap": heatmap,
                     "query_route_weights": torch.tensor([[0.25, 0.25, 0.25, 0.25]], dtype=torch.float32),
                     "query_reliability": torch.tensor([[0.4, 0.3, 0.2, 0.1]], dtype=torch.float32),
+                    "anchor_heatmap": heatmap,
+                    "residual_logits": torch.zeros_like(heatmap),
+                    "bounded_correction": torch.zeros_like(heatmap),
                 },
             )()
 

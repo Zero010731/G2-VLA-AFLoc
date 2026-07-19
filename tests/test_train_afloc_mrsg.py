@@ -13,12 +13,20 @@ from anaprior.models.afloc_mrsg import AFLocMRSG, MRSGConfig
 from anaprior.models.afloc_mrsg.contracts import MRSGOutput
 from anaprior.models.afloc_mrsg.diagnostics import PhaseGateDecision
 from tests.mrsg_test_utils import (
-    FakeAFLoc,
+    FakeAFLoc as BaseFakeAFLoc,
     healthy_grounding_diagnostics,
     write_descriptions,
     write_failed_checkpoint,
     write_tiny_manifest,
 )
+
+
+class FakeAFLoc(BaseFakeAFLoc):
+    """Training fake with the real AFLoc iel/teg shared embedding dimension."""
+
+    def image_encoder_forward(self, images: torch.Tensor):
+        local, local2, local_final, global_embedding = super().image_encoder_forward(images)
+        return local[:, : self.text_dim], local2, local_final, global_embedding
 
 
 def trainer_module():
@@ -241,6 +249,8 @@ def test_locality_phase_trains_only_pyramid_and_mask_predictor(tmp_path: Path) -
     assert report["uses_mscxr_annotations"] is False
     assert report["uses_spatial_annotations"] is False
     assert report["uses_dcem"] is False
+    assert checkpoint["architecture"] == "official_afloc_anchor_bounded_residual_v1"
+    assert checkpoint["uses_official_afloc_anchor"] is True
     assert set(report["four_top_level_loss_weights"]) == {
         "w_ground",
         "w_teacher",

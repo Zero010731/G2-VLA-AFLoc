@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -22,13 +23,29 @@ class _ResidualConvBlock(nn.Module):
         return self.activation(features + self.layers(features))
 
 
-class StandaloneDenseDecoder(nn.Module):
-    def __init__(self, feature_dim: int, hidden_dim: int | None = None) -> None:
+@dataclass(frozen=True)
+class BoundedResidualOutput:
+    final_heatmap: torch.Tensor
+    residual_logits: torch.Tensor
+    bounded_correction: torch.Tensor
+    correction_bound: torch.Tensor
+
+
+class AnchorBoundedResidualDecoder(nn.Module):
+    def __init__(
+        self,
+        feature_dim: int,
+        hidden_dim: int | None = None,
+        residual_logit_bound: float = 0.5,
+    ) -> None:
         super().__init__()
         if feature_dim <= 0:
             raise ValueError("feature_dim must be positive")
+        if not 0.0 < residual_logit_bound <= 2.0:
+            raise ValueError("residual_logit_bound must be in (0,2]")
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim or feature_dim
+        self.residual_logit_bound = float(residual_logit_bound)
         input_channels = feature_dim * 6 + 9
         self.input_projection = nn.Conv2d(input_channels, self.hidden_dim, kernel_size=1)
         self.blocks = nn.Sequential(
@@ -36,6 +53,8 @@ class StandaloneDenseDecoder(nn.Module):
             _ResidualConvBlock(self.hidden_dim),
         )
         self.output_head = nn.Conv2d(self.hidden_dim, 1, kernel_size=1)
+        nn.init.zeros_(self.output_head.weight)
+        nn.init.zeros_(self.output_head.bias)
 
     def forward(
         self,
@@ -43,8 +62,15 @@ class StandaloneDenseDecoder(nn.Module):
         query_outputs: Sequence[QueryOperatorOutput],
         route_weights: torch.Tensor,
         query_patch_gates: torch.Tensor,
-    ) -> torch.Tensor:
-        self._validate(pyramid, query_outputs, route_weights, query_patch_gates)
+        official_anchor: torch.Tensor,
+    ) -> BoundedResidualOutput:
+        self._validate(
+            pyramid,
+            query_outputs,
+            route_weights,
+            query_patch_gates,
+            official_anchor,
+        )
         query_features = torch.stack([output.features for output in query_outputs], dim=1)
         query_heatmaps = torch.cat(
             [torch.sigmoid(output.heatmap_logits) for output in query_outputs],
@@ -68,12 +94,17 @@ class StandaloneDenseDecoder(nn.Module):
             ),
             dim=1,
         )
-        raw_refinement = self.output_head(self.blocks(self.input_projection(decoder_input)))
-        centered_refinement = raw_refinement - raw_refinement.mean(dim=(-2, -1), keepdim=True)
-        bounded_refinement = 0.5 * torch.tanh(centered_refinement)
-        routed_query_map = weighted_query_maps.sum(dim=1, keepdim=True)
-        routed_query_logits = torch.logit(routed_query_map.clamp(1.0e-4, 1.0 - 1.0e-4))
-        return torch.sigmoid(routed_query_logits + bounded_refinement)
+        residual_logits = self.output_head(self.blocks(self.input_projection(decoder_input)))
+        correction_bound = torch.full_like(residual_logits, self.residual_logit_bound)
+        bounded_correction = correction_bound * torch.tanh(residual_logits)
+        anchor_logits = torch.logit(official_anchor.detach())
+        final_heatmap = torch.sigmoid(anchor_logits + bounded_correction)
+        return BoundedResidualOutput(
+            final_heatmap=final_heatmap,
+            residual_logits=residual_logits,
+            bounded_correction=bounded_correction,
+            correction_bound=correction_bound,
+        )
 
     def _validate(
         self,
@@ -81,6 +112,7 @@ class StandaloneDenseDecoder(nn.Module):
         query_outputs: Sequence[QueryOperatorOutput],
         route_weights: torch.Tensor,
         query_patch_gates: torch.Tensor,
+        official_anchor: torch.Tensor,
     ) -> None:
         if pyramid.ndim != 4:
             raise ValueError("pyramid must have shape [B,C,H,W]")
@@ -106,3 +138,11 @@ class StandaloneDenseDecoder(nn.Module):
             raise ValueError("route_weights must have shape [B,4]")
         if query_patch_gates.shape != (batch_size, 4, height, width):
             raise ValueError("query_patch_gates must have shape [B,4,H,W]")
+        if official_anchor.shape != (batch_size, 1, height, width):
+            raise ValueError("official_anchor must have shape [B,1,H,W]")
+        if official_anchor.requires_grad:
+            raise ValueError("official_anchor must be detached")
+        if not torch.isfinite(official_anchor).all():
+            raise ValueError("official_anchor must contain finite values")
+        if bool((official_anchor <= 0.0).any()) or bool((official_anchor >= 1.0).any()):
+            raise ValueError("official_anchor values must be strictly inside (0,1)")

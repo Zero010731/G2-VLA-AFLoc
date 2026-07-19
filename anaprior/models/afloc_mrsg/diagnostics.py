@@ -61,6 +61,7 @@ def collect_mrsg_diagnostics(
     positive_negative_margin = _positive_negative_margin(positive_scores, negative_scores)
     teacher_confident_coverage = _teacher_confident_coverage(teacher_target)
     grad_diagnostics = _gradient_norm_diagnostics(model)
+    refinement_diagnostics = _anchor_refinement_diagnostics(output)
 
     masked_loss, masked_loss_finite = _finite_scalar(masked_reconstruction_loss)
     untrained_loss, untrained_loss_finite = _finite_scalar(untrained_masked_reconstruction_loss)
@@ -97,7 +98,58 @@ def collect_mrsg_diagnostics(
         "consistency_margin_delta_vs_phase_b": consistency_margin_delta,
     }
     diagnostics.update(grad_diagnostics)
+    diagnostics.update(refinement_diagnostics)
     return diagnostics
+
+
+def _anchor_refinement_diagnostics(output: MRSGOutput) -> dict[str, float]:
+    if any(
+        value is None
+        for value in (
+            output.anchor_heatmap,
+            output.residual_logits,
+            output.bounded_correction,
+            output.correction_bound,
+        )
+    ):
+        return {
+            "residual_mean": 0.0,
+            "residual_abs_mean": 0.0,
+            "residual_max_abs": 0.0,
+            "correction_abs_mean": 0.0,
+            "correction_max_abs": 0.0,
+            "correction_bound_max": 0.0,
+            "final_anchor_mae": 0.0,
+            "final_anchor_pearson": 0.0,
+        }
+
+    residual = output.residual_logits.detach()
+    correction = output.bounded_correction.detach()
+    bound = output.correction_bound.detach()
+    anchor = output.anchor_heatmap.detach()
+    final = output.final_heatmap.detach()
+    return {
+        "residual_mean": float(residual.mean().cpu().item()),
+        "residual_abs_mean": float(residual.abs().mean().cpu().item()),
+        "residual_max_abs": float(residual.abs().max().cpu().item()),
+        "correction_abs_mean": float(correction.abs().mean().cpu().item()),
+        "correction_max_abs": float(correction.abs().max().cpu().item()),
+        "correction_bound_max": float(bound.max().cpu().item()),
+        "final_anchor_mae": float((final - anchor).abs().mean().cpu().item()),
+        "final_anchor_pearson": _batch_spatial_pearson(final, anchor),
+    }
+
+
+def _batch_spatial_pearson(left: torch.Tensor, right: torch.Tensor) -> float:
+    left_flat = left.flatten(1)
+    right_flat = right.flatten(1)
+    left_centered = left_flat - left_flat.mean(dim=1, keepdim=True)
+    right_centered = right_flat - right_flat.mean(dim=1, keepdim=True)
+    numerator = (left_centered * right_centered).sum(dim=1)
+    denominator = torch.sqrt(
+        left_centered.square().sum(dim=1) * right_centered.square().sum(dim=1)
+    ).clamp_min(1.0e-12)
+    return float((numerator / denominator).mean().cpu().item())
 
 
 def evaluate_phase_gate(
@@ -150,6 +202,24 @@ def evaluate_phase_gate(
         reasons.append(gradient_reason)
     elif all_module_gradient_norms_finite < 1.0:
         reasons.append("nonfinite_gradient_norms")
+
+    refinement_keys = {
+        "residual_abs_mean",
+        "correction_max_abs",
+        "correction_bound_max",
+        "final_anchor_pearson",
+    }
+    if normalized_phase == "grounding" and refinement_keys.issubset(diagnostics):
+        residual_abs_mean = float(diagnostics["residual_abs_mean"])
+        correction_max_abs = float(diagnostics["correction_max_abs"])
+        correction_bound_max = float(diagnostics["correction_bound_max"])
+        final_anchor_pearson = float(diagnostics["final_anchor_pearson"])
+        if residual_abs_mean <= 1.0e-8:
+            reasons.append("inactive_residual")
+        if correction_max_abs > correction_bound_max + 1.0e-6:
+            reasons.append("correction_bound_violated")
+        if final_anchor_pearson < 0.8:
+            reasons.append("anchor_rank_not_preserved")
 
     if normalized_phase == "locality":
         masked_finite, masked_finite_reason = _gate_flag_or_scalar_finite(

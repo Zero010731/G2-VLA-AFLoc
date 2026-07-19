@@ -5,7 +5,7 @@ import inspect
 import pytest
 import torch
 
-from anaprior.models.afloc_mrsg.dense_decoder import StandaloneDenseDecoder
+from anaprior.models.afloc_mrsg.dense_decoder import AnchorBoundedResidualDecoder
 from anaprior.models.afloc_mrsg.grounding_transformer import (
     MultiQuerySparsePhrasePatchGrounder,
 )
@@ -114,95 +114,68 @@ def test_sparse_grounding_each_query_depends_on_phrase_tokens() -> None:
         assert grad.abs().sum().item() > 0.0
 
 
-def test_decoder_output_is_independent_of_dcem_or_base_heatmap() -> None:
-    signature = inspect.signature(StandaloneDenseDecoder.forward)
-    assert "base_hmap" not in signature.parameters
+def test_decoder_requires_official_anchor_and_excludes_dcem() -> None:
+    signature = inspect.signature(AnchorBoundedResidualDecoder.forward)
+    assert "official_anchor" in signature.parameters
     assert "dcem" not in signature.parameters
     assert "fallback" not in signature.parameters
 
 
-def test_decoder_returns_direct_normalized_heatmap_with_gradients() -> None:
+def test_zero_initialized_decoder_recovers_official_anchor() -> None:
     torch.manual_seed(17)
-    decoder = StandaloneDenseDecoder(feature_dim=16)
+    decoder = AnchorBoundedResidualDecoder(feature_dim=16, residual_logit_bound=0.5)
+    pyramid = torch.rand(2, 16, 8, 8)
+    query_features = make_query_features()
+    query_outputs = make_query_outputs(query_features)
+    route_weights = torch.softmax(torch.rand(2, 4), dim=-1)
+    query_patch_gates = torch.rand(2, 4, 8, 8)
+    anchor = torch.rand(2, 1, 8, 8).clamp(1.0e-4, 1.0 - 1.0e-4)
+
+    output = decoder(pyramid, query_outputs, route_weights, query_patch_gates, anchor)
+
+    assert torch.allclose(output.final_heatmap, anchor, atol=1.0e-6)
+    assert torch.count_nonzero(output.residual_logits) == 0
+    assert torch.count_nonzero(output.bounded_correction) == 0
+    assert torch.all(output.correction_bound == 0.5)
+
+
+def test_decoder_correction_is_bounded_and_trainable() -> None:
+    decoder = AnchorBoundedResidualDecoder(feature_dim=16, residual_logit_bound=0.5)
+    with torch.no_grad():
+        decoder.output_head.weight.fill_(0.01)
+        decoder.output_head.bias.fill_(1.0)
     pyramid = torch.rand(2, 16, 8, 8, requires_grad=True)
     query_features = make_query_features()
     query_outputs = make_query_outputs(query_features)
     route_weights = torch.softmax(torch.rand(2, 4, requires_grad=True), dim=-1)
     query_patch_gates = torch.rand(2, 4, 8, 8, requires_grad=True)
+    anchor = torch.rand(2, 1, 8, 8).clamp(1.0e-4, 1.0 - 1.0e-4)
 
-    heatmap = decoder(pyramid, query_outputs, route_weights, query_patch_gates)
+    output = decoder(pyramid, query_outputs, route_weights, query_patch_gates, anchor)
 
-    assert heatmap.shape == (2, 1, 8, 8)
-    assert torch.isfinite(heatmap).all()
-    assert heatmap.min().item() >= 0.0
-    assert heatmap.max().item() <= 1.0
-
-    heatmap.mean().backward()
-    assert pyramid.grad is not None
-    assert query_features.grad is not None
-    assert query_patch_gates.grad is not None
+    assert output.bounded_correction.abs().max().item() <= 0.5
+    output.final_heatmap.mean().backward()
     assert decoder.output_head.weight.grad is not None
     assert pyramid.grad.abs().sum().item() > 0.0
     assert query_features.grad.abs().sum().item() > 0.0
     assert query_patch_gates.grad.abs().sum().item() > 0.0
 
 
-def test_decoder_is_non_identity_and_has_no_base_fallback_behavior() -> None:
-    torch.manual_seed(23)
-    decoder = StandaloneDenseDecoder(feature_dim=16)
-    pyramid = torch.rand(1, 16, 8, 8)
-    query_features = torch.rand(1, 4, 16, 8, 8)
-    query_outputs = make_query_outputs(query_features)
-    route_weights = torch.tensor([[0.7, 0.1, 0.1, 0.1]])
-    query_patch_gates = torch.rand(1, 4, 8, 8)
-
-    heatmap = decoder(pyramid, query_outputs, route_weights, query_patch_gates)
-    first_query = torch.sigmoid(query_outputs[0].heatmap_logits)
-    route_only = (
-        torch.stack([torch.sigmoid(item.heatmap_logits[:, 0]) for item in query_outputs], dim=1)
-        * route_weights.view(1, 4, 1, 1)
-    ).sum(dim=1, keepdim=True)
-
-    assert not torch.allclose(heatmap, first_query)
-    assert not torch.allclose(heatmap, route_only)
-
-
-def test_decoder_global_bias_cannot_collapse_routed_spatial_evidence() -> None:
-    decoder = StandaloneDenseDecoder(feature_dim=16)
-    query_features = torch.rand(1, 4, 16, 8, 8)
-    query_outputs = make_query_outputs(query_features)
-    route_weights = torch.tensor([[0.4, 0.3, 0.2, 0.1]])
-    with torch.no_grad():
-        decoder.output_head.weight.zero_()
-        decoder.output_head.bias.fill_(1000.0)
-
-    heatmap = decoder(
-        torch.rand(1, 16, 8, 8),
-        query_outputs,
-        route_weights,
-        torch.rand(1, 4, 8, 8),
-    )
-    routed = (
-        torch.stack([torch.sigmoid(item.heatmap_logits[:, 0]) for item in query_outputs], dim=1)
-        * route_weights[:, :, None, None]
-    ).sum(dim=1, keepdim=True)
-
-    assert torch.allclose(heatmap, routed, atol=1.0e-5)
-    assert heatmap.std(unbiased=False) > 1.0e-3
-
-
 def test_decoder_rejects_invalid_shapes() -> None:
-    decoder = StandaloneDenseDecoder(feature_dim=16)
+    decoder = AnchorBoundedResidualDecoder(feature_dim=16)
     pyramid = torch.rand(2, 16, 8, 8)
     query_outputs = make_query_outputs(torch.rand(2, 4, 16, 8, 8))
     route_weights = torch.full((2, 4), 0.25)
     query_patch_gates = torch.rand(2, 4, 8, 8)
+    anchor = torch.rand(2, 1, 8, 8)
 
     with pytest.raises(ValueError, match="pyramid"):
-        decoder(pyramid[:, :15], query_outputs, route_weights, query_patch_gates)
+        decoder(pyramid[:, :15], query_outputs, route_weights, query_patch_gates, anchor)
     with pytest.raises(ValueError, match="query_outputs"):
-        decoder(pyramid, query_outputs[:3], route_weights, query_patch_gates)
+        decoder(pyramid, query_outputs[:3], route_weights, query_patch_gates, anchor)
     with pytest.raises(ValueError, match="route_weights"):
-        decoder(pyramid, query_outputs, route_weights[:, :3], query_patch_gates)
+        decoder(pyramid, query_outputs, route_weights[:, :3], query_patch_gates, anchor)
     with pytest.raises(ValueError, match="query_patch_gates"):
-        decoder(pyramid, query_outputs, route_weights, query_patch_gates[:, :, :7])
+        decoder(pyramid, query_outputs, route_weights, query_patch_gates[:, :, :7], anchor)
+    with pytest.raises(ValueError, match="official_anchor"):
+        decoder(pyramid, query_outputs, route_weights, query_patch_gates, anchor[:, :, :7])

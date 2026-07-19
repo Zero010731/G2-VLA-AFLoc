@@ -60,11 +60,13 @@ class MRSGTeacher(nn.Module):
         self,
         image_features,
         phrase_features,
+        official_anchor: torch.Tensor,
         patch_mask: torch.Tensor | None = None,
     ) -> TeacherTarget:
         output = self.model(
             image_features,
             phrase_features,
+            official_anchor=official_anchor,
             patch_mask=patch_mask,
         )
         final_heatmap = output.final_heatmap.detach()
