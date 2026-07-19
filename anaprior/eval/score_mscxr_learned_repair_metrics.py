@@ -227,6 +227,17 @@ def resolve_hmap_key(
     return None
 
 
+def canonical_metric_case_id(
+    dataset_case_id: Any,
+    hmap_payload: dict[str, Any],
+    hmap_key: str,
+) -> str:
+    """Use dataset identity for paired metrics, independent of method storage keys."""
+    if dataset_case_id is not None and str(dataset_case_id):
+        return str(dataset_case_id)
+    return str(hmap_payload.get("case_id", hmap_key))
+
+
 def filter_eval_dataframe_by_hmap_keys(
     data: pd.DataFrame,
     hmap_keys: set[str],
@@ -882,7 +893,7 @@ def evaluate_hmaps(data: pd.DataFrame, hmaps: dict[str, dict[str, Any]], dataset
             cat_cnrs[cat].append(cnr)
             cat_dices[cat].append(dice)
 
-            resolved_case_id = str(hmaps[key].get("case_id", key))
+            resolved_case_id = canonical_metric_case_id(case_id, hmaps[key], key)
             case_metrics[resolved_case_id]["path"] = str(path)
             case_metrics[resolved_case_id]["dicom_id"] = Path(str(path)).stem
             case_metrics[resolved_case_id]["label_text"] = label_text

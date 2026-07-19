@@ -12,6 +12,7 @@ from anaprior.eval.score_mscxr_learned_repair_metrics import (
     _concat_result_frames,
     build_validation_gate_decisions,
     build_validation_gated_per_case,
+    canonical_metric_case_id,
     build_paired_delta_table,
     comparison_specs_for_methods,
     coerce_eval_dataframe,
@@ -337,6 +338,20 @@ def test_anchor_method_gets_standalone_baseline_comparisons() -> None:
         "afloc_anchor",
         "phrase_anatomy_dcem",
     ) in specs
+
+
+def test_metric_case_id_prefers_dataset_identity_over_storage_key() -> None:
+    assert canonical_metric_case_id(
+        dataset_case_id="canonical-case",
+        hmap_payload={"case_id": "method-specific-case"},
+        hmap_key="legacy-path-plus-phrase",
+    ) == "canonical-case"
+
+    assert canonical_metric_case_id(
+        dataset_case_id=None,
+        hmap_payload={"case_id": "method-specific-case"},
+        hmap_key="legacy-path-plus-phrase",
+    ) == "method-specific-case"
 
 
 def test_evaluate_hmaps_rejects_empty_eval_data_before_bootstrap(tmp_path) -> None:

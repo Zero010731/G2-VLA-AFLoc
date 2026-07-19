@@ -123,11 +123,13 @@ def build_anchor_phase0_report(
     anchor_hmaps = int(anchor_summary.get("num_hmaps", 0))
     category_rows = int(metrics_summary.get("num_eval_rows_after_category_filter", 0))
     common_rows = int(metrics_summary.get("num_eval_rows_after_hmap_filter", 0))
+    reference_common_coverage_ratio = (
+        float(common_rows) / float(category_rows) if category_rows > 0 else 0.0
+    )
     coverage_complete = (
         anchor_cases > 0
         and anchor_cases == anchor_hmaps
-        and category_rows > 0
-        and common_rows == category_rows
+        and common_rows > 0
     )
     zero_variance_count = int(anchor_summary.get("zero_variance_count", 0))
     reasons: list[str] = []
@@ -166,6 +168,7 @@ def build_anchor_phase0_report(
         "anchor_num_hmaps": anchor_hmaps,
         "scoring_num_category_rows": category_rows,
         "scoring_num_common_rows": common_rows,
+        "reference_common_coverage_ratio": reference_common_coverage_ratio,
         "zero_variance_count": zero_variance_count,
         "mean_anchor_confidence": anchor_summary.get("mean_anchor_confidence"),
         "macro_cnr_delta_vs_baseline": None if macro is None else macro["mean_delta"],

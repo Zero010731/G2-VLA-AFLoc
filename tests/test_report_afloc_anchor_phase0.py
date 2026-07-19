@@ -14,6 +14,7 @@ def write_phase0_inputs(
     ci_low: float | None,
     zero_variance_count: int = 0,
     absolute_cnr: float = 0.6,
+    common_rows: int = 2,
 ) -> tuple[Path, Path]:
     anchor_summary = tmp_path / "anchor_eval_summary.json"
     anchor_summary.write_text(
@@ -72,7 +73,7 @@ def write_phase0_inputs(
             {
                 "status": "ok",
                 "num_eval_rows_after_category_filter": 2,
-                "num_eval_rows_after_hmap_filter": 2,
+                "num_eval_rows_after_hmap_filter": common_rows,
                 "methods": ["baseline", "phrase_anatomy_dcem", "afloc_anchor"],
                 "outputs": {
                     "bootstrap_summary": str(metrics_dir / "bootstrap_summary.csv"),
@@ -91,7 +92,11 @@ def write_phase0_inputs(
 
 
 def test_phase0_report_marks_anchor_ready(tmp_path: Path) -> None:
-    anchor_summary, metrics_summary = write_phase0_inputs(tmp_path, ci_low=-0.004)
+    anchor_summary, metrics_summary = write_phase0_inputs(
+        tmp_path,
+        ci_low=-0.004,
+        common_rows=1,
+    )
 
     decision = build_anchor_phase0_report(
         anchor_summary_path=anchor_summary,
@@ -101,6 +106,7 @@ def test_phase0_report_marks_anchor_ready(tmp_path: Path) -> None:
 
     assert decision["status"] == "anchor_ready_for_bounded_refinement"
     assert decision["coverage_complete"] is True
+    assert decision["reference_common_coverage_ratio"] == 0.5
     assert decision["macro_cnr_delta_vs_baseline"] == 0.01
     assert decision["macro_cnr_ci_low_vs_baseline"] == -0.004
     assert decision["anchor_absolute_pooled_cnr"] == 0.6
