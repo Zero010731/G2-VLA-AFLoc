@@ -326,6 +326,19 @@ def test_concat_result_frames_preserves_all_nan_summary_columns_for_insufficient
     assert decision["reason"] == "missing_test_cnr_summary"
 
 
+def test_anchor_method_gets_standalone_baseline_comparisons() -> None:
+    specs = comparison_specs_for_methods(
+        {"baseline", "phrase_anatomy_dcem", "afloc_anchor"}
+    )
+
+    assert ("afloc_anchor_vs_baseline", "afloc_anchor", "baseline") in specs
+    assert (
+        "afloc_anchor_vs_phrase_anatomy_dcem",
+        "afloc_anchor",
+        "phrase_anatomy_dcem",
+    ) in specs
+
+
 def test_evaluate_hmaps_rejects_empty_eval_data_before_bootstrap(tmp_path) -> None:
     empty = pd.DataFrame(columns=["path", "label_text", "gtmasks", "category"])
 

@@ -445,3 +445,44 @@ Add EMA only after the student demonstrates real patch localization.
 
 This is a new forward architecture, not a parameter adjustment to the rejected
 model.
+
+## 15. Phase 0 Anchor-Only Execution
+
+Phase 0 is implemented as a standalone evidence run. It does not train MRSG and
+does not require a MIMIC training CSV.
+
+```bash
+cd /home/zhangran/zr/AnaPrior-Loc-AFLoc-MRSG-runtime
+
+git fetch origin codex/afloc-mrsg
+git checkout codex/afloc-mrsg
+git pull --ff-only origin codex/afloc-mrsg
+
+source /mnt/zhangran/conda_envs/afloc/bin/activate
+
+export OUTROOT="/mnt3/zhangran/anaprior_outputs/anaprior_stage_k_afloc_anchor_phase0_run1"
+export AFLOC_CHECKPOINT="/mnt/zhangran/AFLoc_weight_path/pretrained/Pretrained_CXR.ckpt"
+export AFLOC_BERT_TYPE="/mnt/zhangran/Bio_ClinicalBERT"
+export LOCALIZATION_MS_CXR_JSON="/mnt/zhangran/ms-cxr_1.1.0/MS_CXR_Local_Alignment_v1.1.0.json"
+export LOCALIZATION_MIMIC_IMG_DIR="/mnt/mimic-cxr/jpg"
+export REFERENCE_HMAPS_ROOT="/mnt3/zhangran/anaprior_outputs/anaprior_stage_c_8class_phrase_validation_gate_alias_v2_dcem_v3/learned_repair_hmaps"
+export CUDA_VISIBLE_DEVICES=1
+export DEVICE=cuda
+
+PREFLIGHT_ONLY=1 bash scripts/run_afloc_anchor_phase0_server.sh
+bash scripts/run_afloc_anchor_phase0_server.sh 2>&1 | tee "${OUTROOT}.log"
+```
+
+Primary outputs:
+
+```text
+anchor_eval/afloc_anchor/hmaps.npy
+anchor_eval/anchor_eval_summary.json
+metrics/learned_repair_metrics_summary.json
+report/anchor_phase0_decision.json
+report/anchor_phase0_report.md
+anchor_phase0_manifest.json
+```
+
+Do not begin bounded-residual implementation until
+`report/anchor_phase0_decision.json` has been reviewed.

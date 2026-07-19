@@ -94,9 +94,9 @@ def comparison_specs_for_methods(
             append_dynamic(name, method_a, method_b)
 
     for method in sorted(method_set):
-        if not method.startswith(("dp_msa", "dense_dp_msa", "afloc_mrsg")):
+        if not method.startswith(("dp_msa", "dense_dp_msa", "afloc_mrsg", "afloc_anchor")):
             continue
-        if method.startswith("afloc_mrsg"):
+        if method.startswith(("afloc_mrsg", "afloc_anchor")):
             baseline_methods = ["baseline", "phrase_anatomy_dcem"]
         else:
             baseline_methods = ["baseline", "phrase_anatomy_dcem", "candidate_shuffled"]
