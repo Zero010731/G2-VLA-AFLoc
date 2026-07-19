@@ -9,6 +9,7 @@ MRSG_RUNTIME_PATHS = (
         Path("anaprior/data/mrsg_phrases.py"),
         Path("anaprior/data/mrsg_protocol.py"),
         Path("anaprior/eval/eval_mscxr_afloc_mrsg.py"),
+        Path("anaprior/eval/eval_mscxr_afloc_anchor.py"),
         Path("anaprior/features/afloc_mrsg_encoder.py"),
         Path("anaprior/features/afloc_preprocessing.py"),
         Path("anaprior/train/build_mrsg_image_report_cache.py"),
