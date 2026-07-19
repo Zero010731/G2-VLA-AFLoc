@@ -486,3 +486,57 @@ anchor_phase0_manifest.json
 
 Do not begin bounded-residual implementation until
 `report/anchor_phase0_decision.json` has been reviewed.
+
+## 16. Phase 0 Result and Phase 0b Decision
+
+The handcrafted multi-scale token-max anchor was formally evaluated and is
+rejected as the forward base:
+
+| Evidence | Result |
+|---|---:|
+| Formal test cases | 632 paired cases |
+| Absolute pooled CNR | 0.6423 |
+| Versus AFLoc pooled CNR delta | -0.9164 |
+| Versus AFLoc macro CNR delta | -1.0546 |
+| Versus DCEM-v3 pooled CNR delta | -0.9942 |
+| Per-class direction versus AFLoc | 8/8 negative |
+
+The earlier diagnostic overlap result (top-k IoU 0.1983, Dice 0.3108,
+pointing hit 0.5594) therefore did not establish main-metric suitability. It
+used original report phrases and overlap diagnostics, while the formal run
+showed that multi-scale token-max heatmaps do not preserve AFLoc's CNR.
+Scale agreement was also overconfident: mean confidence was 0.8176 despite the
+large paired CNR loss.
+
+The old `afloc_anchor` method remains a named rejected ablation. It must not be
+silently repaired or reused as the new anchor.
+
+The next fixed gate is Phase 0b:
+
+```text
+AFLoc official localization path
+  = first returned local image embedding (iel)
+  x global report embedding (teg)
+  -> Gaussian smoothing, sigma=1.5
+  -> bilinear resize
+  -> raw similarity heatmap (no new min-max normalization)
+```
+
+`afloc_official_anchor` must reproduce the saved AFLoc baseline directly. The
+acceptance criteria are pixel-level, not visual:
+
+- common-case coverage >= 0.99;
+- at least 900 matched cases in the formal run;
+- mean Pearson correlation >= 0.999;
+- mean absolute error <= 1e-5;
+- no shape mismatch.
+
+Only after this parity gate passes may the official heatmap become the
+unavoidable forward base:
+
+```text
+final = sigmoid(logit(afloc_official_anchor) + confidence_bound * tanh(residual))
+```
+
+No MRSG training, EMA teacher, gate, or residual tuning is allowed before
+official AFLoc parity is established.
