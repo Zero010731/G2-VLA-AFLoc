@@ -98,6 +98,25 @@ def test_anchor_eval_assigns_stable_unique_duplicate_ids(tmp_path: Path) -> None
     assert first.summary["num_duplicate_hmap_keys"] == 1
 
 
+def test_anchor_eval_accepts_classification_phrase_protocol(tmp_path: Path) -> None:
+    result = build_mscxr_afloc_anchor_hmaps(
+        data_rows=[
+            {
+                "path": str(tmp_path / "case.jpg"),
+                "label_text": "Findings suggesting Pneumonia.",
+                "category": "Pneumonia",
+            }
+        ],
+        dataset="MS_CXR_CLS",
+        afloc_checkpoint=tmp_path / "afloc.ckpt",
+        encode_case=lambda row, runtime, device: {
+            "hmap": np.array([[0.0, 1.0], [0.25, 0.5]], dtype=np.float32)
+        },
+    )
+
+    assert result.summary["dataset"] == "MS_CXR_CLS"
+
+
 def test_anchor_eval_counts_zero_variance_and_saves_standard_outputs(tmp_path: Path) -> None:
     result = build_mscxr_afloc_anchor_hmaps(
         data_rows=[

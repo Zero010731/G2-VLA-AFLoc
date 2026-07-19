@@ -23,7 +23,7 @@ from anaprior.models.afloc_mrsg.anchor import compute_afloc_phrase_anchor
 
 
 DEFAULT_METHOD_NAME = "afloc_anchor"
-SUPPORTED_DATASETS = ("MS_CXR", "CHEXLOCALIZE")
+SUPPORTED_DATASETS = ("MS_CXR", "MS_CXR_CLS", "CHEXLOCALIZE")
 
 
 @dataclass(frozen=True)

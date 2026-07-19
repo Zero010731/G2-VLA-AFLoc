@@ -9,6 +9,7 @@ def test_anchor_phase0_server_script_has_frozen_three_stage_contract() -> None:
 
     assert "set -euo pipefail" in script
     assert "eval_mscxr_afloc_anchor" in script
+    assert script.count("--dataset MS_CXR_CLS") == 2
     assert "score_mscxr_learned_repair_metrics" in script
     assert "report_afloc_anchor_phase0" in script
     assert "baseline,phrase_anatomy_dcem,afloc_anchor" in script

@@ -431,7 +431,7 @@ def load_dataset_rows(
     kwargs: dict[str, Any] = {}
     if dataset == "CHEXLOCALIZE":
         kwargs["split"] = split
-    if dataset == "MS_CXR":
+    if dataset in {"MS_CXR", "MS_CXR_CLS"}:
         if ms_cxr_json is not None:
             kwargs["ms_cxr_json"] = ms_cxr_json
         if mimic_img_dir is not None:

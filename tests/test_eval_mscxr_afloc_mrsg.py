@@ -231,6 +231,38 @@ def test_load_dataset_rows_passes_explicit_mscxr_paths(
         "mimic_img_dir": image_root,
     }
 
+
+def test_load_dataset_rows_passes_explicit_paths_for_mscxr_cls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    annotation = tmp_path / "mscxr.json"
+    image_root = tmp_path / "jpg"
+    seen: dict[str, object] = {}
+
+    def fake_load_data(dataset, **kwargs):
+        seen["dataset"] = dataset
+        seen.update(kwargs)
+        return [{"path": "case.jpg", "label_text": "Findings suggesting Edema.", "category": "Edema"}]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "localization.datasets",
+        SimpleNamespace(load_data=fake_load_data),
+    )
+    load_dataset_rows(
+        "MS_CXR_CLS",
+        split="test",
+        ms_cxr_json=annotation,
+        mimic_img_dir=image_root,
+    )
+
+    assert seen == {
+        "dataset": "MS_CXR_CLS",
+        "ms_cxr_json": annotation,
+        "mimic_img_dir": image_root,
+    }
+
 def test_default_encode_case_uses_afloc_process_img_contract(tmp_path: Path) -> None:
     ckpt = write_fake_mrsg_checkpoint(tmp_path)
     image_path = tmp_path / "process-img.jpg"

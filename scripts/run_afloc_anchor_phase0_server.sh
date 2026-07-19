@@ -167,7 +167,7 @@ fi
 if stage_enabled 1; then
   run_cmd 1 "export frozen AFLoc anchor heatmaps" \
     "${PYTHON_BIN}" -m anaprior.eval.eval_mscxr_afloc_anchor \
-    --dataset MS_CXR \
+    --dataset MS_CXR_CLS \
     --split test \
     --afloc-checkpoint "${AFLOC_CHECKPOINT}" \
     --bert-type "${AFLOC_BERT_TYPE}" \
