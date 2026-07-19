@@ -1,8 +1,16 @@
 # AFLoc-MRSG: Box-Free Morphology-Routed Sparse Grounding
 
+> Status: implemented and rejected as the `absolute-decoder MRSG` ablation.
+> Held-out MS-CXR evaluation showed severe all-class localization degradation.
+> Preserve this document as the historical design. It is not the approved next
+> architecture. See `docs/ANAPRIOR_RESEARCH_CONTEXT_2026-07-19.md` for the
+> current diagnosis and Anchor-Preserving MRSG decision.
+
 ## Status
 
-Approved architecture for the next AnaPrior localization main method. This design replaces DCEM-v3 and the lightweight Dense DP-MSA adapter as the main model. Those methods remain evaluation baselines and ablations only.
+Historical approved architecture for the completed standalone experiment. The
+experiment did not replace DCEM-v3 after held-out evaluation; it now remains an
+ablation alongside the lightweight Dense DP-MSA adapter.
 
 ## Objective
 
@@ -469,4 +477,8 @@ The existing AFLoc checkpoint loader and frozen encoder APIs may be reused. Exis
 
 ## Final Decision
 
-AFLoc-MRSG is a standalone box-free grounding model. It replaces DCEM-v3 as the proposed main method, while DCEM-v3 remains an external baseline. The architecture is fixed around four morphology operators, three core innovations, and four top-level loss groups. Parameter sweeps, validation gates, and residual repair are not substitutes for implementing these components.
+AFLoc-MRSG was evaluated as a standalone box-free grounding candidate intended
+to replace DCEM-v3, with DCEM-v3 retained as an external baseline. Held-out
+evaluation rejected that replacement. The architecture remains a historical
+ablation built around four morphology operators, three proposed innovations,
+and four top-level loss groups.

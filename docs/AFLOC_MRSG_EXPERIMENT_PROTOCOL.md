@@ -1,6 +1,14 @@
 # AFLoc-MRSG Server Experiment Protocol
 
-This protocol describes the only supported end-to-end server execution path for standalone AFLoc-MRSG experiments. It is derived from `scripts/run_afloc_mrsg_full_server.sh` and the AFLoc-MRSG box-free design spec.
+> Historical protocol for the rejected standalone absolute-decoder MRSG
+> experiment. Preserve it for reproducibility; do not use it as the protocol for
+> Anchor-Preserving MRSG. Current decisions are recorded in
+> `docs/ANAPRIOR_RESEARCH_CONTEXT_2026-07-19.md`.
+
+This protocol describes the reproducible end-to-end server execution path used
+for the completed standalone absolute-decoder AFLoc-MRSG experiment. It is
+derived from `scripts/run_afloc_mrsg_full_server.sh` and the historical
+AFLoc-MRSG box-free design spec.
 
 ## Core Rules
 

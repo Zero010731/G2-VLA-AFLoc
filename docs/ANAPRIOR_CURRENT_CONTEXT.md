@@ -1,8 +1,15 @@
 # AnaPrior-Loc Detailed Context and Data Ledger
 
+> Historical ledger through 2026-07-06. The current research source of truth is
+> `docs/ANAPRIOR_RESEARCH_CONTEXT_2026-07-19.md`. Subsequent DP-MSA, frozen
+> AFLoc anchor, and standalone AFLoc-MRSG results supersede the method decisions
+> in this older document.
+
 Updated: 2026-07-06
 
-This document is the working context for the AnaPrior part of the automatic research workflow. It records the useful data, the stage-by-stage conclusions, the failure modes, and the paper direction. Treat this as the current source of truth for continuing the project.
+This document was the working context for the AnaPrior part of the automatic
+research workflow through 2026-07-06. It records useful historical data,
+stage-by-stage conclusions, failure modes, and the paper direction at that time.
 
 ## 1. Project Position
 
