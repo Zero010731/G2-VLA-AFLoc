@@ -1372,6 +1372,8 @@ def train_afloc_mrsg(
             valid_epoch["aggregate_negative_scores"],
             valid_epoch["aggregate_negative_mask"],
         )
+        for name in ("anchor_grounding", "cross_view_patch", "anchor_confidence_mean"):
+            diagnostics[name] = float(valid_epoch["losses"].get(name, 0.0))
         phase_gate = evaluate_phase_gate(normalized_phase, diagnostics)
         current_best_valid_loss = min(best_valid_loss, float(valid_epoch["losses"]["total"]))
         payload = _phase_payload(

@@ -780,14 +780,21 @@ def test_validation_diagnostics_use_all_validation_batches_not_last_batch(tmp_pa
     def fake_run_epoch(**kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
-            return _epoch_result(
+            result = _epoch_result(
                 positive_scores=torch.tensor([0.2, 0.3], dtype=torch.float32),
                 negative_scores=torch.tensor([[0.1], [0.1]], dtype=torch.float32),
             )
-        return _epoch_result(
-            positive_scores=torch.tensor([0.1, 0.9], dtype=torch.float32),
-            negative_scores=torch.tensor([[0.8], [0.2]], dtype=torch.float32),
+        else:
+            result = _epoch_result(
+                positive_scores=torch.tensor([0.1, 0.9], dtype=torch.float32),
+                negative_scores=torch.tensor([[0.8], [0.2]], dtype=torch.float32),
+            )
+        result["losses"].update(
+            anchor_grounding=0.25,
+            cross_view_patch=0.15,
+            anchor_confidence_mean=0.75,
         )
+        return result
 
     def fake_collect(**kwargs):
         output = kwargs["output"]
@@ -821,7 +828,7 @@ def test_validation_diagnostics_use_all_validation_batches_not_last_batch(tmp_pa
         ),
     )
     try:
-        module.train_afloc_mrsg(
+        report = module.train_afloc_mrsg(
             phase="locality",
             train_manifest=train_manifest,
             valid_manifest=valid_manifest,
@@ -836,6 +843,10 @@ def test_validation_diagnostics_use_all_validation_batches_not_last_batch(tmp_pa
             seed=13,
             device="cpu",
         )
+        assert report["diagnostics"]["anchor_grounding"] == pytest.approx(0.25)
+        assert report["diagnostics"]["cross_view_patch"] == pytest.approx(0.15)
+        assert report["diagnostics"]["anchor_confidence_mean"] == pytest.approx(0.75)
+        assert report["phase_gate"]["diagnostics"]["anchor_grounding"] == pytest.approx(0.25)
     finally:
         monkeypatch.undo()
 
