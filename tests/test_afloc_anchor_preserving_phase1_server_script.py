@@ -13,6 +13,8 @@ def test_phase1_script_is_grounding_only_anchor_preserving_run() -> None:
     assert "--residual-logit-bound 0.5" in script
     assert "--w-teacher 0.0" in script
     assert "--previous-checkpoint" not in script
+    assert "PHASE1_RESUME_CHECKPOINT" in script
+    assert "--resume-checkpoint" in script
     assert "--validation-gate" not in script
     assert "teacher-decay" not in script
     assert "eval_mscxr_afloc_mrsg" in script

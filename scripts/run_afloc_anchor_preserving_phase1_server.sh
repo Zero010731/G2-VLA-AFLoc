@@ -38,6 +38,7 @@ NUM_WORKERS="${NUM_WORKERS:-2}"
 LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-50}"
 SEED="${SEED:-13}"
 BOOTSTRAP_REPLICATES="${BOOTSTRAP_REPLICATES:-1000}"
+PHASE1_RESUME_CHECKPOINT="${PHASE1_RESUME_CHECKPOINT:-}"
 
 CHECKPOINT="${PHASE_DIR}/mrsg_phase_b.pt"
 TRAIN_REPORT="${PHASE_DIR}/train_report.json"
@@ -100,6 +101,12 @@ fi
 
 mkdir -p "${PHASE_DIR}" "${EVAL_ROOT}" "${SCORE_ROOT}" "${METRIC_ROOT}"
 
+RESUME_ARGS=()
+if [[ -n "${PHASE1_RESUME_CHECKPOINT}" ]]; then
+  require_file "Phase 1 resume checkpoint" "${PHASE1_RESUME_CHECKPOINT}"
+  RESUME_ARGS=(--resume-checkpoint "${PHASE1_RESUME_CHECKPOINT}")
+fi
+
 if stage_enabled 0; then
   echo "[0/3] train anchor-preserving grounding without EMA or cross-view"
   "${PYTHON_BIN}" -m anaprior.train.train_afloc_mrsg \
@@ -110,6 +117,7 @@ if stage_enabled 0; then
     --afloc-checkpoint "${AFLOC_CHECKPOINT}" \
     --protocol-manifest "${PROTOCOL_MANIFEST}" \
     --descriptions-json "${DESCRIPTIONS_JSON}" \
+    "${RESUME_ARGS[@]}" \
     --image-root "${MIMIC_IMAGE_ROOT}" \
     --feature-dim 256 \
     --num-heads 8 \
