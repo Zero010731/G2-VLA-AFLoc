@@ -19,4 +19,6 @@ def test_phase1_script_is_grounding_only_anchor_preserving_run() -> None:
     assert "teacher-decay" not in script
     assert "eval_mscxr_afloc_mrsg" in script
     assert "baseline,phrase_anatomy_dcem,afloc_mrsg" in script
+    assert 'SCORE_DATASET="MS_CXR"' in script
+    assert 'TOKENIZERS_PARALLELISM=false' in script
     assert "START_STAGE must be 0, 1, 2, or 3" in script

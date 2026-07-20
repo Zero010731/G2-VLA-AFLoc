@@ -16,6 +16,7 @@ EVAL_ROOT="${OUTROOT}/mscxr_eval"
 SCORE_ROOT="${OUTROOT}/score_hmaps"
 METRIC_ROOT="${OUTROOT}/metrics"
 METHOD_NAME="afloc_mrsg"
+SCORE_DATASET="MS_CXR"
 
 CACHE_ROOT="${CACHE_ROOT:-${OUTPUT_BASE}/anaprior_stage_j_afloc_mrsg_box_free_full_run3/cache}"
 TRAIN_MANIFEST="${TRAIN_MANIFEST:-${CACHE_ROOT}/train_mrsg.jsonl}"
@@ -47,6 +48,7 @@ GENERATED_HMAPS="${EVAL_ROOT}/${METHOD_NAME}/hmaps.npy"
 export AFLOC_BERT_TYPE
 export AFLOC_HF_LOCAL_FILES_ONLY=1
 export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
 
 require_file() {
   local label="$1"
@@ -201,7 +203,7 @@ if stage_enabled 3; then
     --outdir "${METRIC_ROOT}" \
     --methods baseline,phrase_anatomy_dcem,afloc_mrsg \
     --candidate-categories "Atelectasis,Cardiomegaly,Consolidation,Edema,Lung Opacity,Pleural Effusion,Pneumonia,Pneumothorax" \
-    --dataset MS_CXR_CLS \
+    --dataset "${SCORE_DATASET}" \
     --val-fraction 0.3 \
     --bootstrap-replicates "${BOOTSTRAP_REPLICATES}" \
     --seed "${SEED}" \
