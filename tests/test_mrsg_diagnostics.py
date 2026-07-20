@@ -109,6 +109,20 @@ def test_grounding_gate_rejects_anchor_destruction_or_inactive_residual() -> Non
     assert evaluate_phase_gate("grounding", inactive).reasons == ("inactive_residual",)
 
 
+def test_grounding_gate_rejects_excessive_raw_residual_saturation() -> None:
+    diagnostics = {
+        **healthy_grounding_diagnostics(),
+        "all_module_gradient_norms_finite": 1.0,
+        "residual_abs_mean": 0.2,
+        "correction_max_abs": 0.4,
+        "correction_bound_max": 0.5,
+        "final_anchor_pearson": 0.95,
+        "residual_saturation_ratio": 0.2,
+    }
+
+    assert evaluate_phase_gate("grounding", diagnostics).reasons == ("residual_saturation",)
+
+
 def test_diagnostics_report_final_heatmap_distribution() -> None:
     diagnostics = collect_mrsg_diagnostics(output=_student_output())
 

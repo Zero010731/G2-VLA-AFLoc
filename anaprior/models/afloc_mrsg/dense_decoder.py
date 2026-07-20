@@ -29,6 +29,7 @@ class BoundedResidualOutput:
     residual_logits: torch.Tensor
     bounded_correction: torch.Tensor
     correction_bound: torch.Tensor
+    raw_residual_logits: torch.Tensor
 
 
 class AnchorBoundedResidualDecoder(nn.Module):
@@ -37,6 +38,7 @@ class AnchorBoundedResidualDecoder(nn.Module):
         feature_dim: int,
         hidden_dim: int | None = None,
         residual_logit_bound: float = 0.5,
+        residual_logit_cap: float = 2.0,
     ) -> None:
         super().__init__()
         if feature_dim <= 0:
@@ -46,12 +48,16 @@ class AnchorBoundedResidualDecoder(nn.Module):
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim or feature_dim
         self.residual_logit_bound = float(residual_logit_bound)
+        if residual_logit_cap <= 0.0:
+            raise ValueError("residual_logit_cap must be positive")
+        self.residual_logit_cap = float(residual_logit_cap)
         input_channels = feature_dim * 6 + 9
         self.input_projection = nn.Conv2d(input_channels, self.hidden_dim, kernel_size=1)
         self.blocks = nn.Sequential(
             _ResidualConvBlock(self.hidden_dim),
             _ResidualConvBlock(self.hidden_dim),
         )
+        self.residual_norm = nn.GroupNorm(1, self.hidden_dim)
         self.output_head = nn.Conv2d(self.hidden_dim, 1, kernel_size=1)
         nn.init.zeros_(self.output_head.weight)
         nn.init.zeros_(self.output_head.bias)
@@ -94,7 +100,11 @@ class AnchorBoundedResidualDecoder(nn.Module):
             ),
             dim=1,
         )
-        residual_logits = self.output_head(self.blocks(self.input_projection(decoder_input)))
+        decoded = self.blocks(self.input_projection(decoder_input))
+        raw_residual_logits = self.output_head(self.residual_norm(decoded))
+        residual_logits = self.residual_logit_cap * torch.tanh(
+            raw_residual_logits / self.residual_logit_cap
+        )
         correction_bound = torch.full_like(residual_logits, self.residual_logit_bound)
         bounded_correction = correction_bound * torch.tanh(residual_logits)
         anchor_logits = torch.logit(official_anchor.detach())
@@ -104,6 +114,7 @@ class AnchorBoundedResidualDecoder(nn.Module):
             residual_logits=residual_logits,
             bounded_correction=bounded_correction,
             correction_bound=correction_bound,
+            raw_residual_logits=raw_residual_logits,
         )
 
     def _validate(

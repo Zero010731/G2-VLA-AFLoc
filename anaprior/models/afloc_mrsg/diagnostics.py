@@ -124,6 +124,11 @@ def _anchor_refinement_diagnostics(output: MRSGOutput) -> dict[str, float]:
         }
 
     residual = output.residual_logits.detach()
+    raw_residual = (
+        output.raw_residual_logits.detach()
+        if output.raw_residual_logits is not None
+        else residual
+    )
     correction = output.bounded_correction.detach()
     bound = output.correction_bound.detach()
     anchor = output.anchor_heatmap.detach()
@@ -132,6 +137,11 @@ def _anchor_refinement_diagnostics(output: MRSGOutput) -> dict[str, float]:
         "residual_mean": float(residual.mean().cpu().item()),
         "residual_abs_mean": float(residual.abs().mean().cpu().item()),
         "residual_max_abs": float(residual.abs().max().cpu().item()),
+        "raw_residual_max_abs": float(raw_residual.abs().max().cpu().item()),
+        "residual_saturation_ratio": float(
+            raw_residual.abs().ge(1.6)
+            .float().mean().cpu().item()
+        ),
         "correction_abs_mean": float(correction.abs().mean().cpu().item()),
         "correction_max_abs": float(correction.abs().max().cpu().item()),
         "correction_bound_max": float(bound.max().cpu().item()),
@@ -220,6 +230,8 @@ def evaluate_phase_gate(
             reasons.append("correction_bound_violated")
         if final_anchor_pearson < 0.8:
             reasons.append("anchor_rank_not_preserved")
+        if float(diagnostics.get("residual_saturation_ratio", 0.0)) > 0.1:
+            reasons.append("residual_saturation")
 
     if normalized_phase == "locality":
         masked_finite, masked_finite_reason = _gate_flag_or_scalar_finite(

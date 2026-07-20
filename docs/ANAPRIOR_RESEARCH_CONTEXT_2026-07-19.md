@@ -568,3 +568,22 @@ final-to-routed-query alignment loss is removed. Phase 1 trains grounding only,
 with no EMA, no cross-view consistency, and no validation gate. It must show a
 nonzero residual, respect the correction bound, and preserve final-anchor
 Pearson correlation >= 0.8 before raw MS-CXR scoring is allowed.
+
+## 18. Phase 1 Result and Phase 2 Freeze
+
+Phase 1 completed end to end on 1162 MS-CXR cases. It improved macro CNR over
+AFLoc by 0.03125 but the confidence interval crossed zero. Pneumothorax,
+Pleural Effusion, and Cardiomegaly improved, while Pneumonia declined. Raw
+residual logits reached 1256 although the bounded correction remained within
+0.5, identifying residual saturation and disease-heterogeneous patch evidence
+as the next mechanisms to address.
+
+Phase 2 is frozen as three sequential, disease-agnostic stages:
+
+1. 2A adds GroupNorm, a residual-logit cap of 2.0, and residual stability loss.
+2. 2B adds geometric consistency on signed correction maps.
+3. 2C adds same-image negative-phrase correction contrast.
+
+All stages keep the official AFLoc anchor mandatory, use no spatial labels,
+DCEM, disease rules, EMA, or validation gate, and load the preceding checkpoint
+only as model initialization. Intermediate stages do not inspect MS-CXR test.

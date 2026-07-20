@@ -27,6 +27,8 @@ from anaprior.models.afloc_mrsg.losses import (
     MRSGGroupedLoss,
     compute_mrsg_loss,
     cross_view_patch_consistency_loss,
+    phrase_swap_correction_contrast_loss,
+    residual_stability_loss,
     teacher_equivariance_loss,
 )
 from anaprior.models.afloc_mrsg.teacher import MRSGTeacher, TeacherTarget, teacher_confidence, transform_heatmap
@@ -178,6 +180,7 @@ def _resolve_model_config(
                 topk_fraction=model_config.topk_fraction,
                 route_temperature=model_config.route_temperature,
                 residual_logit_bound=model_config.residual_logit_bound,
+                residual_logit_cap=model_config.residual_logit_cap,
                 query_names=model_config.query_names,
             )
         return model_config
@@ -396,20 +399,26 @@ def _negative_scores(
     negative_phrases: Sequence[Sequence[str]],
     disease_descriptions: Sequence[str],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size = len(negative_phrases)
     max_negatives = max((len(items) for items in negative_phrases), default=0)
     if max_negatives == 0:
+        spatial_size = tuple(image_features.img_emb_l2.shape[-2:])
         return (
             torch.zeros(batch_size, 0, device=device),
             torch.zeros(batch_size, 0, dtype=torch.bool, device=device),
+            torch.zeros(batch_size, 0, 1, *spatial_size, device=device),
         )
     rows = []
     masks = []
+    correction_rows = []
     for batch_index, phrases in enumerate(negative_phrases):
         if not phrases:
             rows.append(torch.zeros(max_negatives, device=device))
             masks.append(torch.zeros(max_negatives, dtype=torch.bool, device=device))
+            correction_rows.append(
+                torch.zeros(max_negatives, 1, *image_features.img_emb_l2.shape[-2:], device=device)
+            )
             continue
         description = [disease_descriptions[batch_index]] * len(phrases)
         phrase_features = _encode_batch_phrases(
@@ -432,6 +441,7 @@ def _negative_scores(
                 official_anchor=negative_anchor,
             )
         scores = _score_output(negative_output)
+        corrections = negative_output.bounded_correction
         mask = torch.ones(scores.shape[0], dtype=torch.bool, device=scores.device)
         if scores.shape[0] < max_negatives:
             pad = torch.zeros(max_negatives - scores.shape[0], device=scores.device, dtype=scores.dtype)
@@ -443,9 +453,22 @@ def _negative_scores(
                 ],
                 dim=0,
             )
+            correction_pad = torch.zeros(
+                max_negatives - corrections.shape[0],
+                1,
+                *corrections.shape[-2:],
+                device=corrections.device,
+                dtype=corrections.dtype,
+            )
+            corrections = torch.cat([corrections, correction_pad], dim=0)
         rows.append(scores)
         masks.append(mask)
-    return torch.stack(rows, dim=0), torch.stack(masks, dim=0)
+        correction_rows.append(corrections)
+    return (
+        torch.stack(rows, dim=0),
+        torch.stack(masks, dim=0),
+        torch.stack(correction_rows, dim=0),
+    )
 
 
 def _teacher_negative_scores(
@@ -564,6 +587,7 @@ def _batch_forward_and_loss(
     epoch: int,
     step: int,
     weights: Mapping[str, float],
+    refinement_weights: Mapping[str, float],
     teacher: MRSGTeacher | None,
 ) -> tuple[MRSGGroupedLoss, Any, torch.Tensor, torch.Tensor, torch.Tensor, TeacherTarget | None]:
     strong_images = batch["strong_image"].to(device)
@@ -602,7 +626,7 @@ def _batch_forward_and_loss(
 
     cross_view_loss = None
     equiv_output = None
-    if phase == "consistency":
+    if phase == "consistency" or float(refinement_weights["w_cross_correction"]) > 0.0:
         equiv_features = _encode_batch_images(
             afloc_encoder,
             equiv_images,
@@ -621,22 +645,29 @@ def _batch_forward_and_loss(
             official_anchor=equiv_anchor,
         )
         aligned_student = _transform_batch_heatmap(
-            output.final_heatmap,
+            output.bounded_correction,
             batch,
             tuple(equiv_output.final_heatmap.shape[-2:]),
         )
         cross_view_loss = cross_view_patch_consistency_loss(
             aligned_student,
-            equiv_output.final_heatmap,
-            torch.ones_like(equiv_output.final_heatmap),
+            equiv_output.bounded_correction,
+            torch.ones_like(equiv_output.bounded_correction),
         )
 
     teacher_target = None
     if phase == "locality":
         negative_scores = (positive_scores.detach().unsqueeze(1) * 0.5).clamp(0.0, 1.0)
         negative_mask = torch.ones_like(negative_scores, dtype=torch.bool)
+        negative_corrections = torch.zeros(
+            output.final_heatmap.shape[0],
+            1,
+            1,
+            *output.final_heatmap.shape[-2:],
+            device=output.final_heatmap.device,
+        )
     else:
-        negative_scores, negative_mask = _negative_scores(
+        negative_scores, negative_mask, negative_corrections = _negative_scores(
             model=model,
             afloc_encoder=afloc_encoder,
             image_features=image_features,
@@ -662,7 +693,7 @@ def _batch_forward_and_loss(
         assert equiv_output is not None
         student_for_teacher = equiv_output
         equiv_positive_scores = _score_output(student_for_teacher)
-        equiv_negative_scores, equiv_negative_mask = _negative_scores(
+        equiv_negative_scores, equiv_negative_mask, _ = _negative_scores(
             model=model,
             afloc_encoder=afloc_encoder,
             image_features=equiv_features,
@@ -686,6 +717,15 @@ def _batch_forward_and_loss(
             negative_mask=equiv_negative_mask,
         )
 
+    stability_value = residual_stability_loss(
+        output.raw_residual_logits,
+        cap=model.config.residual_logit_cap,
+    )
+    phrase_swap_value = phrase_swap_correction_contrast_loss(
+        output.bounded_correction,
+        negative_corrections,
+        negative_mask,
+    )
     loss = compute_mrsg_loss(
         student=output,
         positive_scores=positive_scores,
@@ -698,6 +738,9 @@ def _batch_forward_and_loss(
         anchor_heatmap=anchor_heatmap,
         anchor_confidence=anchor_confidence,
         cross_view_loss=cross_view_loss,
+        residual_stability=stability_value,
+        phrase_swap_loss=phrase_swap_value,
+        **refinement_weights,
     )
     if phase == "consistency":
         teacher_loss = teacher_equivariance_loss(
@@ -742,6 +785,7 @@ def _phase_payload(
     image_channels: tuple[int, int, int],
     afloc_trainable_parameters: int,
     previous_checkpoint: Path | None,
+    initial_checkpoint: Path | None,
     completed_epochs: int,
     best_valid_loss: float,
     trainable_modules: Mapping[str, bool],
@@ -780,6 +824,7 @@ def _phase_payload(
             "optimizer_state_dict": optimizer.state_dict(),
             "checkpoint": str(checkpoint_path),
             "previous_checkpoint": None if previous_checkpoint is None else str(previous_checkpoint),
+            "initial_checkpoint": None if initial_checkpoint is None else str(initial_checkpoint),
             "completed_epochs": int(completed_epochs),
             "best_valid_loss": float(best_valid_loss),
             "best_checkpoint": None if best_checkpoint is None else str(best_checkpoint),
@@ -888,6 +933,11 @@ def _diagnostic_output_snapshot(output: Any, limit: int) -> Any:
         correction_bound=(
             None if output.correction_bound is None else _cpu_slice(output.correction_bound, limit)
         ),
+        raw_residual_logits=(
+            None
+            if output.raw_residual_logits is None
+            else _cpu_slice(output.raw_residual_logits, limit)
+        ),
     )
 
 
@@ -952,6 +1002,11 @@ def _concat_mrsg_outputs(outputs: list[Any]) -> Any:
         correction_bound=(
             torch.cat([output.correction_bound for output in outputs], dim=0)
             if first.correction_bound is not None
+            else None
+        ),
+        raw_residual_logits=(
+            torch.cat([output.raw_residual_logits for output in outputs], dim=0)
+            if first.raw_residual_logits is not None
             else None
         ),
     )
@@ -1033,10 +1088,17 @@ def _run_epoch(
     optimizer: torch.optim.Optimizer | None,
     weights: Mapping[str, float],
     teacher: MRSGTeacher | None,
+    refinement_weights: Mapping[str, float] | None = None,
     max_steps: int | None = None,
     num_workers: int = 0,
     log_every_steps: int = 100,
 ) -> dict[str, Any]:
+    resolved_refinement_weights = {
+        "w_residual_stability": 0.0,
+        "w_cross_correction": 0.0,
+        "w_phrase_swap": 0.0,
+        **dict(refinement_weights or {}),
+    }
     dataset.set_epoch(epoch)
     loader = _make_loader(
         dataset,
@@ -1063,6 +1125,8 @@ def _run_epoch(
         "cross_view_patch": [],
         "anchor_confidence_mean": [],
         "phrase_patch_refinement": [],
+        "residual_stability": [],
+        "phrase_swap_contrast": [],
     }
     last_output = None
     last_positive = None
@@ -1097,6 +1161,7 @@ def _run_epoch(
             epoch=epoch,
             step=step,
             weights=weights,
+            refinement_weights=resolved_refinement_weights,
             teacher=teacher,
         )
         if is_training:
@@ -1116,6 +1181,8 @@ def _run_epoch(
             "cross_view_patch",
             "anchor_confidence_mean",
             "phrase_patch_refinement",
+            "residual_stability",
+            "phrase_swap_contrast",
         ):
             totals[name].append(float(loss.diagnostics.get(name, 0.0)))
         completed_step = step + 1
@@ -1225,6 +1292,7 @@ def train_afloc_mrsg(
     descriptions_json: Path | str | None = None,
     protocol_manifest: Path | str | None = None,
     previous_checkpoint: Path | str | None = None,
+    initial_checkpoint: Path | str | None = None,
     resume_checkpoint: Path | str | None = None,
     image_root: Path | str | None = None,
     model_config: MRSGConfig | Mapping[str, Any] | None = None,
@@ -1240,6 +1308,9 @@ def train_afloc_mrsg(
     w_teacher: float = 1.0,
     w_mask: float = 1.0,
     w_query: float = 1.0,
+    w_residual_stability: float = 0.0,
+    w_cross_correction: float = 0.0,
+    w_phrase_swap: float = 0.0,
     seed: int = 13,
     device: str = "cpu",
 ) -> dict[str, Any]:
@@ -1258,6 +1329,7 @@ def train_afloc_mrsg(
     descriptions_path = None if descriptions_json is None else Path(descriptions_json)
     protocol_path = None if protocol_manifest is None else Path(protocol_manifest)
     previous_path = None if previous_checkpoint is None else Path(previous_checkpoint)
+    initial_path = None if initial_checkpoint is None else Path(initial_checkpoint)
     resume_path = None if resume_checkpoint is None else Path(resume_checkpoint)
     torch_device = torch.device(device)
     protocol_facts = _validate_protocol_manifest(protocol_path)
@@ -1299,6 +1371,17 @@ def train_afloc_mrsg(
     _set_seed(seed)
     resolved_config = _resolve_model_config(model_config, inferred_text_dim=inferred_text_dim)
     model = AFLocMRSG(resolved_config, image_channels=image_channels).to(torch_device)
+    if initial_path is not None:
+        initial_payload = _load_checkpoint(initial_path)
+        if initial_payload.get("architecture") != "official_afloc_anchor_bounded_residual_v1":
+            raise ValueError("initial checkpoint is not anchor-preserving MRSG")
+        missing, unexpected = model.load_state_dict(initial_payload["model_state_dict"], strict=False)
+        allowed_missing = {"decoder.residual_norm.weight", "decoder.residual_norm.bias"}
+        if set(missing) - allowed_missing or unexpected:
+            raise ValueError(
+                f"initial checkpoint is incompatible; missing={sorted(missing)}, "
+                f"unexpected={sorted(unexpected)}"
+            )
     trainable_modules = _configure_phase_trainability(model, normalized_phase)
     weights = _resolve_loss_weights(
         normalized_phase,
@@ -1307,6 +1390,11 @@ def train_afloc_mrsg(
         w_mask=w_mask,
         w_query=w_query,
     )
+    refinement_weights = {
+        "w_residual_stability": float(w_residual_stability),
+        "w_cross_correction": float(w_cross_correction),
+        "w_phrase_swap": float(w_phrase_swap),
+    }
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=float(learning_rate),
@@ -1382,6 +1470,7 @@ def train_afloc_mrsg(
             optimizer=optimizer,
             weights=weights,
             teacher=teacher,
+            refinement_weights=refinement_weights,
             max_steps=max_train_steps,
             num_workers=num_workers,
             log_every_steps=log_every_steps,
@@ -1399,6 +1488,7 @@ def train_afloc_mrsg(
             optimizer=None,
             weights=weights,
             teacher=teacher,
+            refinement_weights=refinement_weights,
             max_steps=max_valid_steps,
             num_workers=num_workers,
             log_every_steps=log_every_steps,
@@ -1418,7 +1508,14 @@ def train_afloc_mrsg(
             valid_epoch["aggregate_negative_scores"],
             valid_epoch["aggregate_negative_mask"],
         )
-        for name in ("anchor_grounding", "cross_view_patch", "anchor_confidence_mean"):
+        for name in (
+            "anchor_grounding",
+            "cross_view_patch",
+            "anchor_confidence_mean",
+            "phrase_patch_refinement",
+            "residual_stability",
+            "phrase_swap_contrast",
+        ):
             diagnostics[name] = float(valid_epoch["losses"].get(name, 0.0))
         phase_gate = evaluate_phase_gate(normalized_phase, diagnostics)
         current_best_valid_loss = min(best_valid_loss, float(valid_epoch["losses"]["total"]))
@@ -1444,11 +1541,13 @@ def train_afloc_mrsg(
             image_channels=image_channels,
             afloc_trainable_parameters=afloc_trainable_parameters,
             previous_checkpoint=previous_path,
+            initial_checkpoint=initial_path,
             completed_epochs=epoch + 1,
             best_valid_loss=current_best_valid_loss,
             trainable_modules=trainable_modules,
             best_checkpoint=(best_checkpoint_path if best_payload is not None else None),
         )
+        payload["refinement_loss_weights"] = dict(refinement_weights)
         torch.save(payload, latest_checkpoint_path)
         last_report = {
             "phase": normalized_phase,
@@ -1462,6 +1561,8 @@ def train_afloc_mrsg(
             "phase_gate": payload["phase_gate"],
             "afloc_trainable_parameters": afloc_trainable_parameters,
             "four_top_level_loss_weights": dict(weights),
+            "refinement_loss_weights": dict(refinement_weights),
+            "initial_checkpoint": None if initial_path is None else str(initial_path),
             "data_protocol_sha256": payload["data_protocol_sha256"],
             "description_file_sha256": payload["description_file_sha256"],
             "uses_mscxr_annotations": payload["uses_mscxr_annotations"],
@@ -1553,6 +1654,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--protocol-manifest", required=True, type=Path)
     parser.add_argument("--descriptions-json", type=Path)
     parser.add_argument("--previous-checkpoint", type=Path)
+    parser.add_argument("--initial-checkpoint", type=Path)
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--image-root", type=Path)
     parser.add_argument("--feature-dim", type=int, default=256)
@@ -1562,6 +1664,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--topk-fraction", type=float, default=0.15)
     parser.add_argument("--route-temperature", type=float, default=1.0)
     parser.add_argument("--residual-logit-bound", type=float, default=0.5)
+    parser.add_argument("--residual-logit-cap", type=float, default=2.0)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-train-steps", type=int, default=None)
@@ -1574,6 +1677,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--w-teacher", type=float, default=1.0)
     parser.add_argument("--w-mask", type=float, default=1.0)
     parser.add_argument("--w-query", type=float, default=1.0)
+    parser.add_argument("--w-residual-stability", type=float, default=0.0)
+    parser.add_argument("--w-cross-correction", type=float, default=0.0)
+    parser.add_argument("--w-phrase-swap", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--device", default="cpu")
     return parser.parse_args(argv)
@@ -1588,6 +1694,7 @@ def main(argv: list[str] | None = None) -> int:
         "topk_fraction": float(args.topk_fraction),
         "route_temperature": float(args.route_temperature),
         "residual_logit_bound": float(args.residual_logit_bound),
+        "residual_logit_cap": float(args.residual_logit_cap),
     }
     if args.text_dim is not None:
         config_payload["text_dim"] = int(args.text_dim)
@@ -1603,6 +1710,7 @@ def main(argv: list[str] | None = None) -> int:
         descriptions_json=args.descriptions_json,
         protocol_manifest=args.protocol_manifest,
         previous_checkpoint=args.previous_checkpoint,
+        initial_checkpoint=args.initial_checkpoint,
         resume_checkpoint=args.resume_checkpoint,
         image_root=args.image_root,
         model_config=config_payload,
@@ -1618,6 +1726,9 @@ def main(argv: list[str] | None = None) -> int:
         w_teacher=args.w_teacher,
         w_mask=args.w_mask,
         w_query=args.w_query,
+        w_residual_stability=args.w_residual_stability,
+        w_cross_correction=args.w_cross_correction,
+        w_phrase_swap=args.w_phrase_swap,
         seed=args.seed,
         device=args.device,
     )

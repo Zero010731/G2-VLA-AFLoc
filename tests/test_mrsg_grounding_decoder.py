@@ -140,7 +140,11 @@ def test_zero_initialized_decoder_recovers_official_anchor() -> None:
 
 
 def test_decoder_correction_is_bounded_and_trainable() -> None:
-    decoder = AnchorBoundedResidualDecoder(feature_dim=16, residual_logit_bound=0.5)
+    decoder = AnchorBoundedResidualDecoder(
+        feature_dim=16,
+        residual_logit_bound=0.5,
+        residual_logit_cap=2.0,
+    )
     with torch.no_grad():
         decoder.output_head.weight.fill_(0.01)
         decoder.output_head.bias.fill_(1.0)
@@ -154,6 +158,8 @@ def test_decoder_correction_is_bounded_and_trainable() -> None:
     output = decoder(pyramid, query_outputs, route_weights, query_patch_gates, anchor)
 
     assert output.bounded_correction.abs().max().item() <= 0.5
+    assert output.residual_logits.abs().max().item() <= 2.0
+    assert torch.isfinite(output.raw_residual_logits).all()
     output.final_heatmap.mean().backward()
     assert decoder.output_head.weight.grad is not None
     assert pyramid.grad.abs().sum().item() > 0.0

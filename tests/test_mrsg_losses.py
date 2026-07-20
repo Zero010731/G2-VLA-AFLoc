@@ -18,6 +18,8 @@ from anaprior.models.afloc_mrsg.losses import (
     cross_modal_grounding_loss,
     masked_patch_distillation_loss,
     phrase_patch_refinement_loss,
+    residual_stability_loss,
+    phrase_swap_correction_contrast_loss,
     query_regularization_loss,
     teacher_equivariance_loss,
 )
@@ -37,6 +39,31 @@ def test_phrase_patch_refinement_drives_final_heatmap_without_target_gradients()
     assert final.grad is not None
     assert final.grad.abs().sum().item() > 0.0
     assert phrase_logits.grad is None
+
+
+def test_residual_stability_penalizes_energy_and_saturation() -> None:
+    calm = torch.tensor([[[[0.1, -0.1], [0.2, -0.2]]]], requires_grad=True)
+    saturated = torch.tensor([[[[0.1, 4.0], [-5.0, -0.2]]]], requires_grad=True)
+
+    calm_loss = residual_stability_loss(calm, cap=2.0)
+    saturated_loss = residual_stability_loss(saturated, cap=2.0)
+    saturated_loss.backward()
+
+    assert saturated_loss > calm_loss
+    assert saturated.grad is not None
+    assert saturated.grad.abs().sum().item() > 0.0
+
+
+def test_phrase_swap_contrast_penalizes_identical_corrections() -> None:
+    positive = torch.tensor([[[[1.0, 0.0], [0.0, -1.0]]]])
+    identical = positive[:, None].clone().requires_grad_(True)
+    distinct = positive.flip(-1)[:, None].clone().requires_grad_(True)
+    mask = torch.tensor([[True]])
+
+    identical_loss = phrase_swap_correction_contrast_loss(positive, identical, mask)
+    distinct_loss = phrase_swap_correction_contrast_loss(positive, distinct, mask)
+
+    assert identical_loss > distinct_loss
 
 
 def test_anchor_patch_grounding_prefers_anchor_supported_region() -> None:

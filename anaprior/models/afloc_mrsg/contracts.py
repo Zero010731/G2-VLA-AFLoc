@@ -14,6 +14,7 @@ class MRSGConfig:
     topk_fraction: float = 0.15
     route_temperature: float = 1.0
     residual_logit_bound: float = 0.5
+    residual_logit_cap: float = 2.0
     query_names: tuple[str, ...] = ("focal", "diffuse", "boundary", "structural")
 
     def __post_init__(self) -> None:
@@ -29,6 +30,8 @@ class MRSGConfig:
             raise ValueError("topk_fraction must be in (0,1]")
         if not 0.0 < self.residual_logit_bound <= 2.0:
             raise ValueError("residual_logit_bound must be in (0,2]")
+        if self.residual_logit_cap <= 0.0:
+            raise ValueError("residual_logit_cap must be positive")
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,7 @@ class MRSGOutput:
     residual_logits: torch.Tensor | None = None
     bounded_correction: torch.Tensor | None = None
     correction_bound: torch.Tensor | None = None
+    raw_residual_logits: torch.Tensor | None = None
 
     def validate(self) -> None:
         if self.final_heatmap.ndim != 4:
@@ -108,6 +112,11 @@ class MRSGOutput:
                 raise ValueError(f"{name} must contain finite values")
         if self.anchor_heatmap.requires_grad:
             raise ValueError("anchor_heatmap must be detached")
+        if self.raw_residual_logits is not None:
+            if self.raw_residual_logits.shape != expected:
+                raise ValueError("raw_residual_logits must have shape [B,1,H,W]")
+            if not torch.isfinite(self.raw_residual_logits).all():
+                raise ValueError("raw_residual_logits must contain finite values")
 
     def _validate_training_fields(self, batch: int, height: int, width: int) -> None:
         if self.masked_predictions is not None or self.source_targets is not None:

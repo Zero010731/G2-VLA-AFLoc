@@ -56,6 +56,7 @@ class AFLocMRSG(nn.Module):
         self.decoder = AnchorBoundedResidualDecoder(
             feature_dim=self.config.feature_dim,
             residual_logit_bound=self.config.residual_logit_bound,
+            residual_logit_cap=self.config.residual_logit_cap,
         )
         self.last_forward_debug: dict[str, torch.Tensor] = {}
 
@@ -130,6 +131,7 @@ class AFLocMRSG(nn.Module):
             residual_logits=decoder_output.residual_logits,
             bounded_correction=decoder_output.bounded_correction,
             correction_bound=decoder_output.correction_bound,
+            raw_residual_logits=decoder_output.raw_residual_logits,
         )
         output.validate()
         self.last_forward_debug = {

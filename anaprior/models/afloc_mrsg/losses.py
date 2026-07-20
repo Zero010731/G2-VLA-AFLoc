@@ -89,6 +89,42 @@ def phrase_patch_refinement_loss(
     return 0.5 * (alignment + rank_alignment)
 
 
+def residual_stability_loss(raw_residual_logits: torch.Tensor, cap: float = 2.0) -> torch.Tensor:
+    if cap <= 0.0:
+        raise ValueError("cap must be positive")
+    _require_finite("raw_residual_logits", raw_residual_logits)
+    energy = raw_residual_logits.square().mean()
+    saturation = F.relu(raw_residual_logits.abs() - 0.8 * cap).square().mean()
+    return 0.1 * energy + saturation
+
+
+def phrase_swap_correction_contrast_loss(
+    positive_correction: torch.Tensor,
+    negative_corrections: torch.Tensor,
+    negative_mask: torch.Tensor,
+    similarity_ceiling: float = 0.5,
+) -> torch.Tensor:
+    if positive_correction.ndim != 4 or positive_correction.shape[1] != 1:
+        raise ValueError("positive_correction must have shape [B,1,H,W]")
+    if negative_corrections.ndim != 5 or negative_corrections.shape[2] != 1:
+        raise ValueError("negative_corrections must have shape [B,N,1,H,W]")
+    if negative_corrections.shape[0] != positive_correction.shape[0]:
+        raise ValueError("positive and negative corrections must share batch size")
+    if negative_corrections.shape[-2:] != positive_correction.shape[-2:]:
+        raise ValueError("positive and negative corrections must share spatial shape")
+    if negative_mask.shape != negative_corrections.shape[:2]:
+        raise ValueError("negative_mask must have shape [B,N]")
+    if not negative_mask.any():
+        return _zero_like_loss(positive_correction, negative_corrections)
+    positive = positive_correction.flatten(1)
+    positive = positive - positive.mean(dim=1, keepdim=True)
+    negative = negative_corrections.flatten(2)
+    negative = negative - negative.mean(dim=2, keepdim=True)
+    similarity = F.cosine_similarity(positive[:, None], negative, dim=2, eps=1.0e-6)
+    penalties = F.relu(similarity - similarity_ceiling)
+    return penalties.masked_select(negative_mask).mean()
+
+
 def _validate_spatial_pair(reference: torch.Tensor, value: torch.Tensor, name: str) -> None:
     if value.shape != reference.shape:
         raise ValueError(f"{name} must match student_heatmap shape")
@@ -233,6 +269,11 @@ def compute_mrsg_loss(
     anchor_heatmap: torch.Tensor | None = None,
     anchor_confidence: torch.Tensor | None = None,
     cross_view_loss: torch.Tensor | None = None,
+    residual_stability: torch.Tensor | None = None,
+    phrase_swap_loss: torch.Tensor | None = None,
+    w_residual_stability: float = 0.0,
+    w_cross_correction: float = 0.0,
+    w_phrase_swap: float = 0.0,
 ) -> MRSGGroupedLoss:
     if not isinstance(student, MRSGOutput):
         raise ValueError("student must be an MRSGOutput")
@@ -241,6 +282,8 @@ def compute_mrsg_loss(
     anchor_loss = _zero_like_loss(student.final_heatmap)
     cross_view_value = _zero_like_loss(student.final_heatmap)
     patch_refinement = _zero_like_loss(student.final_heatmap)
+    residual_stability_value = _zero_like_loss(student.final_heatmap)
+    phrase_swap_value = _zero_like_loss(student.final_heatmap)
     if ground_weight > 0.0:
         if target_phrase is None:
             raise ValueError("target_phrase is required when grounding weight is active")
@@ -270,7 +313,13 @@ def compute_mrsg_loss(
             grounding = grounding + anchor_loss
         if cross_view_loss is not None:
             cross_view_value = cross_view_loss
-            grounding = grounding + cross_view_loss
+            grounding = grounding + float(w_cross_correction) * cross_view_loss
+        if residual_stability is not None:
+            residual_stability_value = residual_stability
+            grounding = grounding + float(w_residual_stability) * residual_stability
+        if phrase_swap_loss is not None:
+            phrase_swap_value = phrase_swap_loss
+            grounding = grounding + float(w_phrase_swap) * phrase_swap_loss
     else:
         grounding = _zero_like_loss(
             positive_scores,
@@ -319,6 +368,8 @@ def compute_mrsg_loss(
             "anchor_grounding": _float_detached(anchor_loss),
             "cross_view_patch": _float_detached(cross_view_value),
             "phrase_patch_refinement": _float_detached(patch_refinement),
+            "residual_stability": _float_detached(residual_stability_value),
+            "phrase_swap_contrast": _float_detached(phrase_swap_value),
             "anchor_confidence_mean": (
                 _float_detached(anchor_confidence.mean())
                 if anchor_confidence is not None
